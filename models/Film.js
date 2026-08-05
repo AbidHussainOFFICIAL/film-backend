@@ -1,0 +1,90 @@
+const { Schema, model } = require("mongoose");
+
+const filmSchema = new Schema({
+  title: { type: String, required: true, trim: true },
+  originalTitle: String,
+  year: Number,
+  country: String,
+  runtime: Number, // minutes
+  category: [{ type: String, index: true }], // from fixed taxonomy (Category.name/slug)
+  tags: [String], // free-text, secondary to category
+  description: String,
+  posterUrl: String,
+  backdropUrl: String,
+  cast: [String],
+  director: String,
+
+  license: {
+    source: String, // "archive.org", "prelinger", "loc"
+    type: String, // "public-domain", "cc0", "cc-by"
+    attributionRequired: Boolean,
+    attributionText: String
+  },
+
+  streamUrl: String, // fallback: direct/progressive URL (e.g. straight from archive.org, no ladder)
+  downloadUrl: String, // fallback: single-quality download
+  storageProvider: { type: String, enum: ["r2", "b2", "storj"], index: true }, // only set if you re-host/transcode this film yourself; absent when streamUrl just points at archive.org
+  sourceHeight: Number, // resolution of the source you're transcoding from — planner never builds a rung above this
+  ladderTier: { type: String, enum: ["minimal", "standard", "high", "premium"] }, // per-title preset; unset = planner picks automatically
+  ladderOverride: [{ // hand-picked exact rungs for this one title, bypasses tier entirely
+    resolution: String,
+    height: Number,
+    bitrateKbps: Number
+  }],
+  manifestUrl: String, // set only if you've re-transcoded this film into your own ladder — takes priority over streamUrl when present
+  transcodeStatus: { type: String, enum: ["not_started", "queued", "processing", "completed", "failed"], default: "not_started" }, // pipeline state for films you DO re-transcode — separate from the moderation `status` below; most archive.org-linked films just stay "not_started" forever
+  masterKey: String, // object key on storageProvider, needed for delete() — only relevant when storageProvider is set
+  renditions: [{
+    resolution: String, // "1080p", "720p", "480p", "360p"
+    height: Number,
+    bitrateKbps: Number,
+    playlistUrl: String,
+    key: String, // object key on storageProvider
+    segmentCount: Number,
+    codec: { type: String, default: "h264" }
+  }],
+  archiveBackup: { // insurance mirror of YOUR re-hosted copy — separate from `archiveIdentifier` below, which is the SOURCE item you pulled from archive.org
+    pushed: { type: Boolean, default: false },
+    archiveIdentifier: String,
+    pushedDate: Date,
+    status: { type: String, enum: ["pending", "completed", "failed"], default: "pending" },
+    error: String
+  },
+  fileHash: String, // SHA-256, for dedup — indexed below (unique+sparse), not inline
+
+  status: { type: String, enum: ["pending", "approved", "rejected"], default: "pending" }, // indexed below as part of the compound browse index
+  verifiedBy: String,
+  verifiedDate: Date,
+  region: { type: String, default: "US" },
+
+  linkHealth: {
+    lastChecked: Date,
+    isHealthy: { type: Boolean, default: true },
+    lastError: String
+  },
+
+  embeddingId: String, // reference to Qdrant vector point ID
+  source: { type: String, enum: ["archive.org", "own-upload"] },
+  archiveIdentifier: String, // Archive.org's own item ID — indexed below (unique+sparse), not inline
+
+  views: { type: Number, default: 0 },
+  avgRating: { type: Number, default: 0 }, // denormalized from Review, updated on write
+  ratingCount: { type: Number, default: 0 },
+
+  addedDate: { type: Date, default: Date.now },
+  updatedDate: Date
+});
+
+// --- Indexes ---
+// dedup: never insert the same physical file twice
+filmSchema.index({ fileHash: 1 }, { unique: true, sparse: true });
+// dedup against re-runs of the same archive.org item
+filmSchema.index({ archiveIdentifier: 1 }, { unique: true, sparse: true });
+// browse/filter: "approved films in category X, newest first"
+filmSchema.index({ status: 1, category: 1, addedDate: -1 });
+// text search fallback (Qdrant handles semantic search; this covers exact/keyword search)
+filmSchema.index({ title: "text", originalTitle: "text", tags: "text", description: "text" });
+// link-health sweep job
+filmSchema.index({ "linkHealth.isHealthy": 1, "linkHealth.lastChecked": 1 });
+
+module.exports = model("Film", filmSchema);

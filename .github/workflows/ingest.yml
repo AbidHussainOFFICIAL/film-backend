@@ -1,0 +1,36 @@
+name: Ingest films from Archive.org
+
+on:
+  schedule:
+    # Runs once a day at 06:00 UTC. Cron uses UTC regardless of your
+    # repo's default timezone.
+    - cron: "0 6 * * *"
+  workflow_dispatch: {} # lets you trigger this manually from the Actions tab
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run ingestion script
+        env:
+          MONGO_URI: ${{ secrets.MONGO_URI }}
+          TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
+        run: node scripts/ingest.js
