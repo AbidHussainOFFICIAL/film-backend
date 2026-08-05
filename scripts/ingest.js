@@ -7,21 +7,26 @@
  * review later.
  *
  * Run manually:   node scripts/ingest.js
- * Run via npm:    npm run ingest   (from inside backend/)
- * Run in CI:      see .github/workflows/ingest.yml
+ * Run via npm:     npm run ingest   (from inside backend/)
+ * Run in CI:       see .github/workflows/ingest.yml
  *
  * Requires Node 18+ (uses the built-in fetch API).
  */
 
 require("dotenv").config();
-const dns = require("dns");
-dns.setServers(["8.8.8.8", "8.8.4.4"]); // Bypass local Windows/ISP DNS blocking for SRV lookups
-
 const crypto = require("crypto");
+const dns = require("dns");
 const mongoose = require("mongoose");
 
 const Film = require("../models/Film");
 const IngestionLog = require("../models/IngestionLog");
+
+// Some networks (corporate VPNs, certain ISPs/routers, some Windows setups)
+// block or mishandle the DNS SRV lookups that `mongodb+srv://` connection
+// strings require, causing `querySrv ECONNREFUSED ...` errors even though
+// normal internet access works fine. Pointing Node's resolver at a public
+// DNS server fixes it. Harmless to leave on for GitHub Actions runners too.
+dns.setServers(["8.8.8.8", "8.8.4.4"]);
 
 // ---------------------------------------------------------------------------
 // Config
@@ -53,21 +58,35 @@ function sha256(input) {
 }
 
 /**
- * fetch() with a hard timeout so a hung request in CI doesn't run forever.
+ * fetch() with a hard timeout so a hung request in CI doesn't run forever,
+ * plus one automatic retry for transient network blips (timeouts, resets) —
+ * flaky Wi-Fi/VPN connections can abort an individual Archive.org request
+ * without anything actually being wrong with that item.
  */
-async function fetchJson(url, { label } = {}) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+async function fetchJson(url, { label, retries = 1 } = {}) {
+  let lastErr;
 
-  try {
-    const res = await fetch(url, { signal: controller.signal });
-    if (!res.ok) {
-      throw new Error(`${label || url} responded with HTTP ${res.status}`);
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
+    try {
+      const res = await fetch(url, { signal: controller.signal });
+      if (!res.ok) {
+        throw new Error(`${label || url} responded with HTTP ${res.status}`);
+      }
+      return await res.json();
+    } catch (err) {
+      lastErr = err;
+      if (attempt < retries) {
+        await sleep(500);
+      }
+    } finally {
+      clearTimeout(timer);
     }
-    return await res.json();
-  } finally {
-    clearTimeout(timer);
   }
+
+  throw lastErr;
 }
 
 // ---------------------------------------------------------------------------

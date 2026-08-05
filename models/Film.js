@@ -1,5 +1,22 @@
 const { Schema, model } = require("mongoose");
 
+// Defined as its own Schema (not a plain object literal) on purpose.
+// license contains a key named `type`, and Mongoose's shorthand rule reads
+// ANY nested object with a `type` key as "this path's type is <that value>"
+// instead of as a subdocument — so `license: { source: String, type: String, ... }`
+// as a plain object was silently being read as `license: String`, discarding
+// source/attributionRequired/attributionText entirely. Wrapping it in an
+// explicit Schema removes that ambiguity.
+const licenseSchema = new Schema(
+  {
+    source: String, // "archive.org", "prelinger", "loc"
+    type: String, // "public-domain", "cc0", "cc-by"
+    attributionRequired: Boolean,
+    attributionText: String
+  },
+  { _id: false }
+);
+
 const filmSchema = new Schema({
   title: { type: String, required: true, trim: true },
   originalTitle: String,
@@ -14,12 +31,7 @@ const filmSchema = new Schema({
   cast: [String],
   director: String,
 
-  license: {
-    source: String, // "archive.org", "prelinger", "loc"
-    type: String, // "public-domain", "cc0", "cc-by"
-    attributionRequired: Boolean,
-    attributionText: String
-  },
+  license: licenseSchema,
 
   streamUrl: String, // fallback: direct/progressive URL (e.g. straight from archive.org, no ladder)
   downloadUrl: String, // fallback: single-quality download
