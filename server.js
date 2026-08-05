@@ -7,6 +7,7 @@ const mongoose = require("mongoose");
 const cors = require("cors");
 
 const filmRoutes = require("./routes/filmRoutes");
+const adminRoutes = require("./routes/adminRoutes");
 
 const app = express();
 
@@ -19,6 +20,7 @@ app.get("/", (req, res) => {
 });
 
 app.use("/api/films", filmRoutes);
+app.use("/api/admin", adminRoutes);
 
 // 404 fallback
 app.use((req, res) => {
@@ -36,6 +38,7 @@ mongoose
   .connect(process.env.MONGO_URI)
   .then(() => {
     console.log("Connected to MongoDB");
+    console.log("Using database:", mongoose.connection.name);
     app.listen(PORT, () => {
       console.log(`Server running on http://localhost:${PORT}`);
     });
