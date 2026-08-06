@@ -22,9 +22,16 @@ async function setFilmStatus(id, status, extra = {}) {
   );
 }
 
+// Only approved films are ever returned here — search results should
+// never leak pending/rejected titles even if something stale is in Qdrant.
+async function getFilmsByIds(ids) {
+  return Film.find({ _id: { $in: ids }, status: "approved" });
+}
+
 module.exports = {
   getApprovedFilms,
   getFilmById,
   getFilmsByStatus,
   setFilmStatus,
+  getFilmsByIds,
 };

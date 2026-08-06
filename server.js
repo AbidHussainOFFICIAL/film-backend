@@ -8,6 +8,7 @@ const cors = require("cors");
 
 const filmRoutes = require("./routes/filmRoutes");
 const adminRoutes = require("./routes/adminRoutes");
+const searchRoutes = require("./routes/searchRoutes");
 
 const app = express();
 
@@ -21,6 +22,7 @@ app.get("/", (req, res) => {
 
 app.use("/api/films", filmRoutes);
 app.use("/api/admin", adminRoutes);
+app.use("/api/search", searchRoutes);
 
 // 404 fallback
 app.use((req, res) => {

@@ -9,9 +9,12 @@
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js",
-    "ingest": "node scripts/ingest.js"
+    "ingest": "node scripts/ingest.js",
+    "qdrant:init": "node scripts/initQdrant.js",
+    "qdrant:reindex": "node scripts/reindexApproved.js"
   },
   "dependencies": {
+    "@qdrant/js-client-rest": "^1.11.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",

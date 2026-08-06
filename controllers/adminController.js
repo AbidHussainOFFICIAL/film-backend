@@ -1,4 +1,6 @@
 const filmService = require("../services/filmService");
+const { getEmbedding, buildEmbeddingText } = require("../services/embedding");
+const { upsertFilmEmbedding, deleteFilmEmbedding } = require("../services/qdrantService");
 
 const VALID_STATUSES = ["pending", "approved", "rejected"];
 
@@ -25,6 +27,22 @@ async function approveFilm(req, res) {
       verifiedDate: new Date(),
     });
     if (!film) return res.status(404).json({ error: "Film not found" });
+
+    // Index into Qdrant for semantic search. Best-effort: the film is
+    // already approved in Mongo at this point, so a failure here (missing
+    // API key, OpenAI/Qdrant hiccup) shouldn't roll that back — it just
+    // means this title won't turn up in search until it's re-indexed.
+    try {
+      const text = buildEmbeddingText(film);
+      const vector = await getEmbedding(text);
+      await upsertFilmEmbedding(film._id, vector, {
+        title: film.title,
+        year: film.year,
+      });
+    } catch (embedErr) {
+      console.error(`Embedding/indexing failed for film ${film._id}:`, embedErr.message);
+    }
+
     res.json(film);
   } catch (err) {
     console.error("Error approving film:", err);
@@ -41,6 +59,11 @@ async function rejectFilm(req, res) {
       verifiedDate: new Date(),
     });
     if (!film) return res.status(404).json({ error: "Film not found" });
+
+    // Best-effort: if this film was previously approved and indexed, make
+    // sure it stops showing up in search now that it's rejected.
+    await deleteFilmEmbedding(film._id);
+
     res.json(film);
   } catch (err) {
     console.error("Error rejecting film:", err);
