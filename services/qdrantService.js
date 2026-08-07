@@ -91,12 +91,21 @@ async function deleteFilmEmbedding(filmId) {
   }
 }
 
-async function searchSimilarFilms(vector, limit = 20) {
+// Cosine similarity below this is treated as "not actually relevant" rather
+// than included just because it's the nearest available point. With a small
+// film collection, vector search will always return *something* for any
+// query — this threshold is what keeps unrelated queries returning empty
+// instead of the 5 least-irrelevant films. Tune via SEARCH_SCORE_THRESHOLD
+// in .env if results feel too strict or too loose.
+const DEFAULT_SCORE_THRESHOLD = Number(process.env.SEARCH_SCORE_THRESHOLD || 0.45);
+
+async function searchSimilarFilms(vector, limit = 20, scoreThreshold = DEFAULT_SCORE_THRESHOLD) {
   const c = await ensureCollection();
   const result = await c.query(COLLECTION_NAME, {
     query: vector,
     limit,
     with_payload: true,
+    score_threshold: scoreThreshold,
   });
   // Newer client versions wrap results in { points: [...] } instead of
   // returning a plain array directly.
