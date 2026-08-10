@@ -15,7 +15,7 @@ async function searchFilms(req, res) {
 
     const limit = Math.min(Number(req.query.limit) || DEFAULT_LIMIT, MAX_LIMIT);
 
-    const vector = await getEmbedding(q);
+    const vector = await getEmbedding(q, { taskType: "query" });
     const results = await searchSimilarFilms(vector, limit);
 
     // Qdrant returns ranked results with each film's Mongo _id in its

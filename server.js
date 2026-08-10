@@ -1,6 +1,10 @@
 require("dotenv").config();
 const dns = require("dns");
-dns.setServers(["8.8.8.8", "8.8.4.4"]); // force Node to use these DNS servers directly
+// Some networks block/mishandle the DNS SRV lookups that mongodb+srv://
+// connection strings require, causing `querySrv ECONNREFUSED ...` errors
+// even though normal internet access works fine. Pointing Node's resolver
+// at a public DNS server fixes it. Harmless to leave on elsewhere too.
+dns.setServers(["8.8.8.8", "8.8.4.4"]);
 
 const express = require("express");
 const mongoose = require("mongoose");
@@ -9,6 +13,8 @@ const cors = require("cors");
 const filmRoutes = require("./routes/filmRoutes");
 const adminRoutes = require("./routes/adminRoutes");
 const searchRoutes = require("./routes/searchRoutes");
+const jobsRoutes = require("./routes/jobsRoutes");
+const serviceRoutes = require("./routes/serviceRoutes");
 
 const app = express();
 
@@ -23,6 +29,8 @@ app.get("/", (req, res) => {
 app.use("/api/films", filmRoutes);
 app.use("/api/admin", adminRoutes);
 app.use("/api/search", searchRoutes);
+app.use("/api/admin/jobs", jobsRoutes);
+app.use("/api/service", serviceRoutes);
 
 // 404 fallback
 app.use((req, res) => {

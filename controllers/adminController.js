@@ -30,11 +30,11 @@ async function approveFilm(req, res) {
 
     // Index into Qdrant for semantic search. Best-effort: the film is
     // already approved in Mongo at this point, so a failure here (missing
-    // API key, OpenAI/Qdrant hiccup) shouldn't roll that back — it just
+    // API key, Nomic/Qdrant hiccup) shouldn't roll that back — it just
     // means this title won't turn up in search until it's re-indexed.
     try {
       const text = buildEmbeddingText(film);
-      const vector = await getEmbedding(text);
+      const vector = await getEmbedding(text, { taskType: "document" });
       await upsertFilmEmbedding(film._id, vector, {
         title: film.title,
         year: film.year,

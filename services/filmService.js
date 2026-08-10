@@ -28,10 +28,21 @@ async function getFilmsByIds(ids) {
   return Film.find({ _id: { $in: ids }, status: "approved" });
 }
 
+// Minimal fields needed to build an embedding — used by the heavy
+// backend's Qdrant reindex job via the /api/service endpoint, not
+// exposed publicly.
+async function getFilmsForEmbedding() {
+  return Film.find(
+    { status: "approved" },
+    { title: 1, description: 1, tags: 1, category: 1, year: 1 }
+  );
+}
+
 module.exports = {
   getApprovedFilms,
   getFilmById,
   getFilmsByStatus,
   setFilmStatus,
   getFilmsByIds,
+  getFilmsForEmbedding,
 };
