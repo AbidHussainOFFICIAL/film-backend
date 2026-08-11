@@ -1,3 +1,7 @@
+// Sentry must be initialized before any other module is required.
+require("./instrument");
+const Sentry = require("@sentry/node");
+
 require("dotenv").config();
 const dns = require("dns");
 // Some networks block/mishandle the DNS SRV lookups that mongodb+srv://
@@ -26,6 +30,28 @@ app.get("/", (req, res) => {
   res.send("Film API is running");
 });
 
+// GET /health — used by UptimeRobot (or any uptime monitor). Reports 503
+// instead of 200 if Mongo isn't actually connected, so a monitor pointed
+// at this catches "server is up but broken" too, not just "server is down".
+app.get("/health", (req, res) => {
+  const mongoConnected = mongoose.connection.readyState === 1;
+  const status = mongoConnected ? "ok" : "degraded";
+
+  res.status(mongoConnected ? 200 : 503).json({
+    status,
+    uptimeSeconds: Math.round(process.uptime()),
+    mongo: mongoConnected ? "connected" : "disconnected",
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// Manual test route to confirm Sentry is actually wired up correctly —
+// hitting this should make an event show up in the Sentry dashboard
+// within a few seconds. Safe to leave in; it does nothing but throw.
+app.get("/api/debug-sentry", () => {
+  throw new Error("Test error — confirms Sentry reporting is working");
+});
+
 app.use("/api/films", filmRoutes);
 app.use("/api/admin", adminRoutes);
 app.use("/api/search", searchRoutes);
@@ -35,6 +61,21 @@ app.use("/api/service", serviceRoutes);
 // 404 fallback
 app.use((req, res) => {
   res.status(404).json({ error: "Not found" });
+});
+
+// Sentry's error handler: catches anything thrown synchronously in a
+// route/middleware (like /api/debug-sentry above) or passed to next(err).
+// Most of this app's own routes catch their own errors and report to
+// Sentry manually (see the controllers) since they respond directly
+// rather than calling next(err) — this is a backstop for anything that
+// isn't already handled that way.
+Sentry.setupExpressErrorHandler(app);
+
+// Final error handler — after Sentry's, so the client still gets a clean
+// JSON response instead of Express's default HTML error page.
+app.use((err, req, res, next) => {
+  console.error("Unhandled error:", err);
+  res.status(500).json({ error: "Internal server error" });
 });
 
 const PORT = process.env.PORT || 5000;

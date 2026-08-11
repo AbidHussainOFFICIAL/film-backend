@@ -1,3 +1,4 @@
+const Sentry = require("@sentry/node");
 const filmService = require("../services/filmService");
 const { getEmbedding } = require("../services/embedding");
 const { searchSimilarFilms } = require("../services/qdrantService");
@@ -30,6 +31,7 @@ async function searchFilms(req, res) {
     res.json(ordered);
   } catch (err) {
     console.error("Search error:", err);
+    Sentry.captureException(err);
     res.status(500).json({ error: "Search failed" });
   }
 }

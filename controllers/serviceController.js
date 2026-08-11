@@ -1,3 +1,4 @@
+const Sentry = require("@sentry/node");
 const Film = require("../models/Film");
 const JobRun = require("../models/JobRun");
 const filmService = require("../services/filmService");
@@ -17,6 +18,7 @@ async function checkExistingFilms(req, res) {
     res.json(result);
   } catch (err) {
     console.error("Error checking existing films:", err);
+    Sentry.captureException(err);
     res.status(500).json({ error: "Failed to check existing films" });
   }
 }
@@ -41,6 +43,7 @@ async function ingestBatch(req, res) {
     res.json(result);
   } catch (err) {
     console.error("Error ingesting batch:", err);
+    Sentry.captureException(err);
     res.status(500).json({ error: "Failed to ingest batch" });
   }
 }
@@ -52,6 +55,7 @@ async function listFilmsForEmbedding(req, res) {
     res.json(films);
   } catch (err) {
     console.error("Error listing films for embedding:", err);
+    Sentry.captureException(err);
     res.status(500).json({ error: "Failed to list films for embedding" });
   }
 }
@@ -72,6 +76,7 @@ async function startJob(req, res) {
     res.json(job);
   } catch (err) {
     console.error("Error starting job:", err);
+    Sentry.captureException(err);
     res.status(500).json({ error: "Failed to start job" });
   }
 }
@@ -91,9 +96,19 @@ async function completeJob(req, res) {
       { new: true }
     );
     if (!job) return res.status(404).json({ error: "JobRun not found" });
+
+    // The heavy backend reported this job as failed — capture it here
+    // centrally, since ingest.js/qdrantReindex.js scripts don't have
+    // their own guaranteed-delivery way to report to Sentry directly
+    // (a crash before their own capture code runs would go unseen).
+    if (status === "failed") {
+      Sentry.captureMessage(`JobRun ${job._id} (${job.type}) failed: ${error || "no error message"}`, "error");
+    }
+
     res.json(job);
   } catch (err) {
     console.error("Error completing job:", err);
+    Sentry.captureException(err);
     res.status(500).json({ error: "Failed to complete job" });
   }
 }
@@ -139,12 +154,17 @@ async function handleUploadCallback(req, res) {
     } else {
       film.transcodeStatus = "failed";
       console.error(`Media processing reported failure for film ${id}:`, error || "(no error message provided)");
+      // Centralized capture point for process-upload.yml's failures — that
+      // workflow is pure bash/ffmpeg, it has no way to call Sentry itself,
+      // so this callback is the only place its failures become visible.
+      Sentry.captureMessage(`Upload processing failed for film ${id}: ${error || "no error message"}`, "error");
     }
 
     await film.save();
     res.json({ ok: true });
   } catch (err) {
     console.error("Error handling upload callback:", err);
+    Sentry.captureException(err);
     res.status(500).json({ error: "Failed to process callback" });
   }
 }

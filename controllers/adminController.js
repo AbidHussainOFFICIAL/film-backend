@@ -1,3 +1,4 @@
+const Sentry = require("@sentry/node");
 const filmService = require("../services/filmService");
 const { getEmbedding, buildEmbeddingText } = require("../services/embedding");
 const { upsertFilmEmbedding, deleteFilmEmbedding } = require("../services/qdrantService");
@@ -15,6 +16,7 @@ async function listFilmsByStatus(req, res) {
     res.json(films);
   } catch (err) {
     console.error("Error listing films by status:", err);
+    Sentry.captureException(err);
     res.status(500).json({ error: "Failed to fetch films" });
   }
 }
@@ -41,11 +43,13 @@ async function approveFilm(req, res) {
       });
     } catch (embedErr) {
       console.error(`Embedding/indexing failed for film ${film._id}:`, embedErr.message);
+      Sentry.captureException(embedErr);
     }
 
     res.json(film);
   } catch (err) {
     console.error("Error approving film:", err);
+    Sentry.captureException(err);
     if (err.name === "CastError") return res.status(400).json({ error: "Invalid film id" });
     res.status(500).json({ error: "Failed to approve film" });
   }
@@ -67,6 +71,7 @@ async function rejectFilm(req, res) {
     res.json(film);
   } catch (err) {
     console.error("Error rejecting film:", err);
+    Sentry.captureException(err);
     if (err.name === "CastError") return res.status(400).json({ error: "Invalid film id" });
     res.status(500).json({ error: "Failed to reject film" });
   }

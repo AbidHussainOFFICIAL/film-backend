@@ -1,3 +1,4 @@
+const Sentry = require("@sentry/node");
 const Film = require("../models/Film");
 const storage = require("../services/storage");
 const { transcribeToVtt } = require("../services/deepgram");
@@ -21,6 +22,7 @@ async function getUploadUrl(req, res) {
     res.json(result); // { uploadUrl, key, publicUrl }
   } catch (err) {
     console.error("Error generating upload URL:", err);
+    Sentry.captureException(err);
     res.status(500).json({ error: "Failed to generate upload URL" });
   }
 }
@@ -78,6 +80,7 @@ async function createUpload(req, res) {
       // Best-effort — a captions failure shouldn't block thumbnail/preview
       // or publishing. Logged for the admin to notice and possibly retry.
       console.error(`Captioning failed for upload ${film._id}:`, captionErr.message);
+      Sentry.captureException(captionErr);
     }
 
     // --- Thumbnail + preview (GitHub Actions, dispatched not awaited) ---
@@ -87,6 +90,7 @@ async function createUpload(req, res) {
       await film.save();
     } catch (dispatchErr) {
       console.error(`Failed to dispatch media processing for ${film._id}:`, dispatchErr.message);
+      Sentry.captureException(dispatchErr);
       film.transcodeStatus = "failed";
       await film.save();
     }
@@ -94,6 +98,7 @@ async function createUpload(req, res) {
     res.status(201).json(film);
   } catch (err) {
     console.error("Error creating upload:", err);
+    Sentry.captureException(err);
     res.status(500).json({ error: "Failed to create upload" });
   }
 }
@@ -117,6 +122,7 @@ async function retryProcessing(req, res) {
     res.json(film);
   } catch (err) {
     console.error("Error retrying processing:", err);
+    Sentry.captureException(err);
     res.status(500).json({ error: "Failed to retry processing" });
   }
 }

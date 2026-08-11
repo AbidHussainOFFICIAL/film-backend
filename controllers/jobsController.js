@@ -1,3 +1,4 @@
+const Sentry = require("@sentry/node");
 const JobRun = require("../models/JobRun");
 const { triggerIngest, triggerQdrantReindex } = require("../services/githubActions");
 
@@ -25,6 +26,7 @@ async function triggerJob(req, res) {
       }
     } catch (dispatchErr) {
       console.error(`Failed to dispatch ${jobType} job ${job._id}:`, dispatchErr.message);
+      Sentry.captureException(dispatchErr);
       job.status = "failed";
       job.error = dispatchErr.message;
       job.completedAt = new Date();
@@ -34,6 +36,7 @@ async function triggerJob(req, res) {
     res.status(201).json(job);
   } catch (err) {
     console.error("Error triggering job:", err);
+    Sentry.captureException(err);
     res.status(500).json({ error: "Failed to trigger job" });
   }
 }
@@ -46,6 +49,7 @@ async function getJob(req, res) {
     res.json(job);
   } catch (err) {
     console.error("Error fetching job:", err);
+    Sentry.captureException(err);
     if (err.name === "CastError") return res.status(400).json({ error: "Invalid job id" });
     res.status(500).json({ error: "Failed to fetch job" });
   }
@@ -62,6 +66,7 @@ async function listJobs(req, res) {
     res.json(jobs);
   } catch (err) {
     console.error("Error listing jobs:", err);
+    Sentry.captureException(err);
     res.status(500).json({ error: "Failed to list jobs" });
   }
 }
