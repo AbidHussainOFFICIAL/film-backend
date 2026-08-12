@@ -42,6 +42,12 @@ const filmSchema = new Schema({
   captionsUrl: String,
   storageProvider: { type: String, enum: ["r2", "b2", "storj"], index: true }, // only set if you re-host/transcode this film yourself; absent when streamUrl just points at archive.org
   sourceHeight: Number, // resolution of the source you're transcoding from — planner never builds a rung above this
+  // Size of the master/source video file in bytes. Populated by ingestion
+  // (from Archive.org's file metadata) and by uploads (from the browser's
+  // File object at upload time). Used to decide sendVideo vs sendDocument
+  // when posting to Telegram (services/telegram.js) — not required
+  // elsewhere, so it's fine for this to be missing on older records.
+  fileSizeBytes: Number,
   ladderTier: { type: String, enum: ["minimal", "standard", "high", "premium"] }, // per-title preset; unset = planner picks automatically
   ladderOverride: [{ // hand-picked exact rungs for this one title, bypasses tier entirely
     resolution: String,

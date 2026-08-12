@@ -2,6 +2,8 @@ const Sentry = require("@sentry/node");
 const filmService = require("../services/filmService");
 const { getEmbedding, buildEmbeddingText } = require("../services/embedding");
 const { upsertFilmEmbedding, deleteFilmEmbedding } = require("../services/qdrantService");
+const { postFilmToTelegram } = require("../services/telegram");
+const { postFilmToChannel } = require("../services/whatsapp");
 
 const VALID_STATUSES = ["pending", "approved", "rejected"];
 
@@ -44,6 +46,26 @@ async function approveFilm(req, res) {
     } catch (embedErr) {
       console.error(`Embedding/indexing failed for film ${film._id}:`, embedErr.message);
       Sentry.captureException(embedErr);
+    }
+
+    // Post to the Telegram channel. Best-effort — a failure here (bad
+    // bot token, self-hosted server down, channel permissions) shouldn't
+    // undo the approval, it just means this title didn't get announced.
+    try {
+      await postFilmToTelegram(film);
+    } catch (telegramErr) {
+      console.error(`Telegram post failed for film ${film._id}:`, telegramErr.message);
+      Sentry.captureException(telegramErr);
+    }
+
+    // Post to the WhatsApp channel. Best-effort like Telegram — a
+    // failure here (not paired, channel JID wrong) shouldn't undo the
+    // approval.
+    try {
+      await postFilmToChannel(film);
+    } catch (whatsappErr) {
+      console.error(`WhatsApp post failed for film ${film._id}:`, whatsappErr.message);
+      Sentry.captureException(whatsappErr);
     }
 
     res.json(film);

@@ -28,7 +28,7 @@ async function getUploadUrl(req, res) {
 }
 
 // POST /api/admin/uploads
-// Body: { key, title, description?, year?, country?, category?, tags?, director?, cast? }
+// Body: { key, title, description?, year?, country?, category?, tags?, director?, cast?, fileSizeBytes? }
 //
 // Two processing tracks run from here:
 //  - Captions (Deepgram): awaited synchronously. Deepgram fetches the R2
@@ -40,7 +40,8 @@ async function getUploadUrl(req, res) {
 //    this: it's "processing" when this request returns, not "completed".
 async function createUpload(req, res) {
   try {
-    const { key, title, description, year, country, category, tags, director, cast } = req.body;
+    const { key, title, description, year, country, category, tags, director, cast, fileSizeBytes } =
+      req.body;
 
     if (!key) {
       return res.status(400).json({ error: "Missing required field: key" });
@@ -60,6 +61,7 @@ async function createUpload(req, res) {
       tags: toArray(tags),
       director,
       cast: toArray(cast),
+      fileSizeBytes: fileSizeBytes ? Number(fileSizeBytes) : undefined,
       source: "own-upload",
       storageProvider: "r2",
       masterKey: key,

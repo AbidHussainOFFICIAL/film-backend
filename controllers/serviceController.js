@@ -4,6 +4,8 @@ const JobRun = require("../models/JobRun");
 const filmService = require("../services/filmService");
 const ingestionService = require("../services/ingestionService");
 const storage = require("../services/storage");
+const { postFilmToTelegram } = require("../services/telegram");
+const { postFilmToChannel } = require("../services/whatsapp");
 
 // ---------------------------------------------------------------------
 // Films — used by the ingest.yml and qdrant-reindex.yml workflows
@@ -161,6 +163,25 @@ async function handleUploadCallback(req, res) {
     }
 
     await film.save();
+
+    // Own-upload just auto-approved — post it, same best-effort pattern
+    // as the manual-approval path in adminController.js.
+    if (status === "completed") {
+      try {
+        await postFilmToTelegram(film);
+      } catch (telegramErr) {
+        console.error(`Telegram post failed for film ${id}:`, telegramErr.message);
+        Sentry.captureException(telegramErr);
+      }
+
+      try {
+        await postFilmToChannel(film);
+      } catch (whatsappErr) {
+        console.error(`WhatsApp post failed for film ${id}:`, whatsappErr.message);
+        Sentry.captureException(whatsappErr);
+      }
+    }
+
     res.json({ ok: true });
   } catch (err) {
     console.error("Error handling upload callback:", err);

@@ -19,6 +19,7 @@ const adminRoutes = require("./routes/adminRoutes");
 const searchRoutes = require("./routes/searchRoutes");
 const jobsRoutes = require("./routes/jobsRoutes");
 const serviceRoutes = require("./routes/serviceRoutes");
+const { connectWhatsApp } = require("./services/whatsapp");
 
 const app = express();
 
@@ -90,6 +91,20 @@ mongoose
   .then(() => {
     console.log("Connected to MongoDB");
     console.log("Using database:", mongoose.connection.name);
+
+    // Best-effort, non-blocking — a missing/broken WhatsApp pairing
+    // shouldn't prevent the server from starting. First run without a
+    // saved session prints a QR code to this terminal to scan.
+    if (process.env.WHATSAPP_CHANNEL_JID) {
+      connectWhatsApp().catch((err) => {
+        console.error("WhatsApp connection failed to start:", err.message);
+      });
+    } else {
+      console.warn(
+        "WHATSAPP_CHANNEL_JID not set — skipping WhatsApp connection. Run scripts/whatsappSetup.js to pair and get a channel JID."
+      );
+    }
+
     app.listen(PORT, () => {
       console.log(`Server running on http://localhost:${PORT}`);
     });
