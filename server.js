@@ -13,6 +13,9 @@ dns.setServers(["8.8.8.8", "8.8.4.4"]);
 const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
+const https = require("https");
+const fs = require("fs");
+const path = require("path");
 
 const filmRoutes = require("./routes/filmRoutes");
 const adminRoutes = require("./routes/adminRoutes");
@@ -105,9 +108,31 @@ mongoose
       );
     }
 
-    app.listen(PORT, () => {
-      console.log(`Server running on http://localhost:${PORT}`);
-    });
+    // If backend/certs/localhost.pem + localhost-key.pem exist (generated
+    // via mkcert — see README "Local HTTPS for testing against a deployed
+    // frontend" section), serve HTTPS instead of plain HTTP. This lets a
+    // deployed frontend (e.g. on Vercel, always HTTPS) reach this local
+    // backend without hitting browsers' increasingly strict blocking of
+    // HTTPS-page-to-HTTP-endpoint requests. Falls back to plain HTTP if
+    // the certs aren't there — nothing breaks for anyone who hasn't set
+    // mkcert up locally.
+    const certPath = path.join(__dirname, "certs", "localhost.pem");
+    const keyPath = path.join(__dirname, "certs", "localhost-key.pem");
+    const hasLocalCerts = fs.existsSync(certPath) && fs.existsSync(keyPath);
+
+    if (hasLocalCerts) {
+      const httpsOptions = {
+        cert: fs.readFileSync(certPath),
+        key: fs.readFileSync(keyPath),
+      };
+      https.createServer(httpsOptions, app).listen(PORT, () => {
+        console.log(`Server running on https://localhost:${PORT} (local HTTPS via mkcert)`);
+      });
+    } else {
+      app.listen(PORT, () => {
+        console.log(`Server running on http://localhost:${PORT}`);
+      });
+    }
   })
   .catch((err) => {
     console.error("MongoDB connection error:", err.message);

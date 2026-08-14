@@ -2,3 +2,5 @@ node_modules/
 .env
 # WhatsApp session credentials (Baileys) — as sensitive as .env, never commit
 .baileys_auth/
+# Local HTTPS cert/key from mkcert — the private key must never be committed
+certs/

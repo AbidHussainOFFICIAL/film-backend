@@ -41,6 +41,56 @@ const AUTO_REPLY_TEXT =
 // reasoning and threshold as the Telegram integration.
 const VIDEO_SIZE_THRESHOLD_BYTES = 250 * 1024 * 1024; // 250MB
 
+// Unlike Telegram (which just needs a URL handed to it), Baileys actually
+// streams the file's bytes through this server to upload it to WhatsApp —
+// so this needs a much longer timeout than a simple API call. A large
+// legitimate upload over a normal connection can genuinely take several
+// minutes; this is here to eventually fail a truly stuck/blocked
+// connection, not to cut off a slow-but-working transfer.
+const WHATSAPP_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+
+// Error codes that mean "never got a response at all" — the fingerprint
+// of a network-level block (e.g. an ISP/region blocking WhatsApp) rather
+// than WhatsApp itself rejecting the request.
+const NETWORK_UNREACHABLE_PATTERNS = [
+  "ETIMEDOUT",
+  "ECONNREFUSED",
+  "ENOTFOUND",
+  "EHOSTUNREACH",
+  "ECONNRESET",
+  "timed out after",
+];
+
+function isNetworkUnreachableError(err) {
+  const msg = err?.message || String(err);
+  return NETWORK_UNREACHABLE_PATTERNS.some((pattern) => msg.includes(pattern));
+}
+
+/**
+ * Wraps a friendly, actionable message around a raw network error instead
+ * of surfacing Node's cryptic connection-refused text — that pattern is
+ * the fingerprint of WhatsApp being blocked at the network/ISP level (a
+ * known, common situation in some regions), not a bug in this code.
+ */
+function friendlyError(err) {
+  if (isNetworkUnreachableError(err)) {
+    return new Error(
+      "WhatsApp appears to be blocked or unreachable from this network " +
+        "(common in some regions). Connect a VPN and try again. " +
+        `(underlying error: ${err.message})`
+    );
+  }
+  return err;
+}
+
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 const logger = pino({ level: "silent" });
 
 let sock = null;
@@ -200,31 +250,56 @@ async function postFilmToChannel(film) {
     typeof film.fileSizeBytes === "number" && film.fileSizeBytes > VIDEO_SIZE_THRESHOLD_BYTES;
 
   if (isKnownLarge) {
-    await connectedSock.sendMessage(CHANNEL_JID, {
-      document: { url: sourceUrl },
-      mimetype: "video/mp4",
-      fileName: `${film.title}.mp4`,
-      caption,
-    });
+    try {
+      await withTimeout(
+        connectedSock.sendMessage(CHANNEL_JID, {
+          document: { url: sourceUrl },
+          mimetype: "video/mp4",
+          fileName: `${film.title}.mp4`,
+          caption,
+        }),
+        WHATSAPP_TIMEOUT_MS,
+        "WhatsApp sendMessage (document)"
+      );
+    } catch (err) {
+      throw friendlyError(err);
+    }
     return;
   }
 
   try {
-    await connectedSock.sendMessage(CHANNEL_JID, {
-      video: { url: sourceUrl },
-      caption,
-    });
+    await withTimeout(
+      connectedSock.sendMessage(CHANNEL_JID, {
+        video: { url: sourceUrl },
+        caption,
+      }),
+      WHATSAPP_TIMEOUT_MS,
+      "WhatsApp sendMessage (video)"
+    );
   } catch (err) {
+    if (isNetworkUnreachableError(err)) {
+      // The network itself is unreachable — the document fallback would
+      // fail the exact same way, no point trying it too.
+      throw friendlyError(err);
+    }
     console.warn(
       `sendMessage(video) failed for film ${film._id}, falling back to document:`,
       err.message
     );
-    await connectedSock.sendMessage(CHANNEL_JID, {
-      document: { url: sourceUrl },
-      mimetype: "video/mp4",
-      fileName: `${film.title}.mp4`,
-      caption,
-    });
+    try {
+      await withTimeout(
+        connectedSock.sendMessage(CHANNEL_JID, {
+          document: { url: sourceUrl },
+          mimetype: "video/mp4",
+          fileName: `${film.title}.mp4`,
+          caption,
+        }),
+        WHATSAPP_TIMEOUT_MS,
+        "WhatsApp sendMessage (document)"
+      );
+    } catch (docErr) {
+      throw friendlyError(docErr);
+    }
   }
 }
 
