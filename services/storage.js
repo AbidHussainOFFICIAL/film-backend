@@ -1,11 +1,17 @@
 /**
  * backend/services/storage.js
  *
- * Wraps Cloudflare R2 (S3-compatible) for the two things the light
- * backend actually does with it:
+ * Wraps Cloudflare R2 (S3-compatible) for the things the light backend
+ * does with it:
  *  1. Presigned PUT URLs so the browser uploads the master video file
- *     directly to R2 — the large file never passes through this server.
- *  2. Uploading small in-memory content (the VTT captions file) right
+ *     directly to R2 — the large file never passes through this server
+ *     (getUploadUrl, random per-upload key).
+ *  2. A presigned PUT URL for a FIXED key — used for assets that should
+ *     always be overwritten in place rather than versioned, so their
+ *     public URL never changes (getFixedUploadUrl; currently used for
+ *     the Android APK release asset, uploaded by film-frontend's
+ *     build-apk.yml workflow).
+ *  3. Uploading small in-memory content (the VTT captions file) right
  *     after Deepgram generates it.
  *
  * Downloading/processing the master file and uploading the resulting
@@ -73,14 +79,13 @@ function buildKey(filename) {
 }
 
 /**
- * Generates a presigned PUT URL the browser can upload directly to.
- * Returns the key so the caller can reference this object later, and the
- * eventual public URL for convenience.
+ * Shared presign logic. The only difference between getUploadUrl and
+ * getFixedUploadUrl below is where `key` comes from — a freshly generated
+ * random one, vs a caller-supplied fixed one.
  */
-async function getUploadUrl(filename, contentType) {
+async function presignPut(key, contentType) {
   const bucket = requireBucket();
   const c = getClient();
-  const key = buildKey(filename);
 
   const command = new PutObjectCommand({
     Bucket: bucket,
@@ -93,6 +98,26 @@ async function getUploadUrl(filename, contentType) {
   });
 
   return { uploadUrl, key, publicUrl: getPublicUrl(key) };
+}
+
+/**
+ * Generates a presigned PUT URL the browser can upload directly to, under
+ * a fresh random key. Returns the key so the caller can reference this
+ * object later, and the eventual public URL for convenience.
+ */
+async function getUploadUrl(filename, contentType) {
+  const key = buildKey(filename);
+  return presignPut(key, contentType);
+}
+
+/**
+ * Like getUploadUrl, but for a caller-supplied FIXED key instead of a
+ * randomly generated one — used when the same object should always be
+ * overwritten in place (e.g. the Android APK release asset), so its
+ * public URL never changes between uploads/builds.
+ */
+async function getFixedUploadUrl(key, contentType) {
+  return presignPut(key, contentType);
 }
 
 /**
@@ -118,6 +143,7 @@ async function uploadBuffer(key, body, contentType) {
 
 module.exports = {
   getUploadUrl,
+  getFixedUploadUrl,
   uploadBuffer,
   getPublicUrl,
   buildKey,

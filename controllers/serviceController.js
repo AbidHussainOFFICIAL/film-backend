@@ -9,6 +9,13 @@ const storage = require("../services/storage");
 const { postFilmToTelegram } = require("../services/telegram");
 const { postFilmToChannel } = require("../services/whatsapp");
 
+// Fixed R2 key for the Android APK release asset — always overwritten in
+// place by film-frontend's build-apk.yml workflow, so the public download
+// URL never changes between builds. Overridable via env in case the key
+// ever needs to move (e.g. a bucket reorganization).
+const APK_STORAGE_KEY = process.env.APK_STORAGE_KEY || "releases/reel-vault.apk";
+const APK_CONTENT_TYPE = "application/vnd.android.package-archive";
+
 // ---------------------------------------------------------------------
 // Films — used by the ingest.yml and qdrant-reindex.yml workflows
 // ---------------------------------------------------------------------
@@ -192,6 +199,27 @@ async function handleUploadCallback(req, res) {
   }
 }
 
+// ---------------------------------------------------------------------
+// APK — used by film-frontend's build-apk.yml workflow
+// ---------------------------------------------------------------------
+
+// GET /api/service/apk/upload-url
+// Returns a presigned PUT URL for a FIXED R2 key (not a random one, unlike
+// the admin upload flow) — every new build overwrites the same object, so
+// the frontend's public download link (see /download/android) never needs
+// to change between builds. Caller uploads the .apk bytes directly to R2
+// with this URL; this server's own bytes are never touched.
+async function getApkUploadUrl(req, res) {
+  try {
+    const result = await storage.getFixedUploadUrl(APK_STORAGE_KEY, APK_CONTENT_TYPE);
+    res.json(result); // { uploadUrl, key, publicUrl }
+  } catch (err) {
+    console.error("Error generating APK upload URL:", err);
+    Sentry.captureException(err);
+    res.status(500).json({ error: "Failed to generate APK upload URL" });
+  }
+}
+
 module.exports = {
   checkExistingFilms,
   ingestBatch,
@@ -199,4 +227,5 @@ module.exports = {
   startJob,
   completeJob,
   handleUploadCallback,
+  getApkUploadUrl,
 };

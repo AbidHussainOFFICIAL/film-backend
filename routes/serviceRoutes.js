@@ -5,8 +5,9 @@ const router = express.Router();
 const verifyServiceSecret = require("../middleware/verifyServiceSecret");
 const serviceController = require("../controllers/serviceController");
 
-// Every route here is called by the heavy backend (GitHub Actions), never
-// by a browser — authenticated with a shared secret, not Firebase.
+// Every route here is called by CI (the heavy backend's GitHub Actions
+// workflows, or film-frontend's build-apk.yml), never by a browser —
+// authenticated with a shared secret, not Firebase.
 router.use(verifyServiceSecret);
 
 router.post("/films/check-existing", serviceController.checkExistingFilms);
@@ -17,5 +18,9 @@ router.post("/jobs/:id/start", serviceController.startJob);
 router.post("/jobs/:id/complete", serviceController.completeJob);
 
 router.post("/uploads/:id/callback", serviceController.handleUploadCallback);
+
+// GET /api/service/apk/upload-url — called by film-frontend's
+// build-apk.yml to get a presigned R2 upload URL for the built APK.
+router.get("/apk/upload-url", serviceController.getApkUploadUrl);
 
 module.exports = router;
