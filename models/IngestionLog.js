@@ -1,3 +1,5 @@
+// backend/models/IngestionLog.js
+
 const { Schema, model } = require("mongoose");
 
 const ingestionLogSchema = new Schema(

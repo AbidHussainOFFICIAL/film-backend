@@ -1,3 +1,5 @@
+// backend/middleware/verifyFirebaseToken.js
+
 const admin = require("../config/firebaseAdmin");
 
 /**

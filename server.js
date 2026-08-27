@@ -1,3 +1,5 @@
+// backend/server.js
+
 // Sentry must be initialized before any other module is required.
 require("./instrument");
 const Sentry = require("@sentry/node");

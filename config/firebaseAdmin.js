@@ -1,3 +1,5 @@
+// backend/config/firebaseAdmin.js
+
 const admin = require("firebase-admin");
 
 // Initialized once, from a Firebase service account's credentials — NOT the

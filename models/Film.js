@@ -1,3 +1,5 @@
+// backend/models/Film.js
+
 const { Schema, model } = require("mongoose");
 
 // Defined as its own Schema (not a plain object literal) on purpose.

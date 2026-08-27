@@ -1,3 +1,5 @@
+// backend/models/JobRun.js
+
 const { Schema, model } = require("mongoose");
 
 /**

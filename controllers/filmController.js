@@ -1,3 +1,5 @@
+// backend/controllers/filmController.js
+
 const Sentry = require("@sentry/node");
 const filmService = require("../services/filmService");
 

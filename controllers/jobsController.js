@@ -1,3 +1,5 @@
+// backend/controllers/jobsController.js
+
 const Sentry = require("@sentry/node");
 const JobRun = require("../models/JobRun");
 const { triggerIngest, triggerQdrantReindex } = require("../services/githubActions");

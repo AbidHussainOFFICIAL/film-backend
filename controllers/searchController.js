@@ -1,3 +1,5 @@
+// backend/controllers/searchController.js
+
 const Sentry = require("@sentry/node");
 const filmService = require("../services/filmService");
 const { getEmbedding } = require("../services/embedding");

@@ -1,3 +1,5 @@
+// backend/controllers/adminController.js
+
 const Sentry = require("@sentry/node");
 const filmService = require("../services/filmService");
 const { getEmbedding, buildEmbeddingText } = require("../services/embedding");
