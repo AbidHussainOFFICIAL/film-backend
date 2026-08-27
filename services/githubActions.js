@@ -41,8 +41,18 @@ async function triggerWorkflow(workflowFile, inputs = {}) {
   }
 }
 
-function triggerUploadProcessing(filmId, masterKey) {
-  return triggerWorkflow("process-upload.yml", { film_id: String(filmId), master_key: masterKey });
+/**
+ * storageProvider tells process-upload.yml which provider's
+ * credentials/endpoint to use when downloading the master and uploading
+ * the resulting thumbnail/preview back — since Slice 12, a film's master
+ * can live on R2, B2, or Storj, not just R2.
+ */
+function triggerUploadProcessing(filmId, masterKey, storageProvider) {
+  return triggerWorkflow("process-upload.yml", {
+    film_id: String(filmId),
+    master_key: masterKey,
+    storage_provider: storageProvider,
+  });
 }
 
 function triggerIngest(jobRunId) {

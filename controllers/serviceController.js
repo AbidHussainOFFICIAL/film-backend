@@ -6,8 +6,10 @@ const JobRun = require("../models/JobRun");
 const filmService = require("../services/filmService");
 const ingestionService = require("../services/ingestionService");
 const storage = require("../services/storage");
+const { getAdapter } = require("../services/adapterRegistry");
 const { postFilmToTelegram } = require("../services/telegram");
 const { postFilmToChannel } = require("../services/whatsapp");
+const { backupFilmToArchiveOrg } = require("../services/archiveBackup");
 
 // Fixed R2 key for the Android APK release asset — always overwritten in
 // place by film-frontend's build-apk.yml workflow, so the public download
@@ -148,10 +150,21 @@ async function handleUploadCallback(req, res) {
       if (!thumbKey || !previewKey) {
         return res.status(400).json({ error: "Missing thumbKey/previewKey for a completed callback" });
       }
+      if (!film.storageProvider) {
+        return res
+          .status(400)
+          .json({ error: "Film has no storageProvider recorded — cannot resolve public URLs" });
+      }
 
-      film.posterUrl = storage.getPublicUrl(thumbKey);
-      film.previewUrl = storage.getPublicUrl(previewKey);
-      film.streamUrl = storage.getPublicUrl(film.masterKey);
+      // Since Slice 12, thumb/preview/master might live on R2, B2, or
+      // Storj — process-upload.yml always uploads them back to whichever
+      // provider the master came from, so we resolve URLs through that
+      // same provider's adapter rather than assuming R2.
+      const adapter = getAdapter(film.storageProvider);
+
+      film.posterUrl = adapter.getPublicUrl(thumbKey);
+      film.previewUrl = adapter.getPublicUrl(previewKey);
+      film.streamUrl = adapter.getPublicUrl(film.masterKey);
       film.downloadUrl = film.streamUrl;
 
       if (sourceHeight) film.sourceHeight = Number(sourceHeight);
@@ -188,6 +201,31 @@ async function handleUploadCallback(req, res) {
       } catch (whatsappErr) {
         console.error(`WhatsApp post failed for film ${id}:`, whatsappErr.message);
         Sentry.captureException(whatsappErr);
+      }
+
+      // Best-effort insurance mirror — a failure here doesn't affect
+      // anything else; the film is already fully playable from its own
+      // storage provider regardless of whether this succeeds. See
+      // services/archiveBackup.js for the important caveat about this
+      // integration not yet being exercised against a live account.
+      try {
+        const identifier = await backupFilmToArchiveOrg(film);
+        film.archiveBackup = {
+          pushed: true,
+          archiveIdentifier: identifier,
+          pushedDate: new Date(),
+          status: "completed",
+        };
+        await film.save();
+      } catch (archiveErr) {
+        console.error(`Archive.org backup failed for film ${id}:`, archiveErr.message);
+        Sentry.captureException(archiveErr);
+        film.archiveBackup = {
+          pushed: false,
+          status: "failed",
+          error: archiveErr.message,
+        };
+        await film.save().catch(() => {});
       }
     }
 

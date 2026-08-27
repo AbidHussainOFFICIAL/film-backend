@@ -1,27 +1,21 @@
 /**
  * backend/services/storage.js
  *
- * Wraps Cloudflare R2 (S3-compatible) for the things the light backend
- * does with it:
- *  1. Presigned PUT URLs so the browser uploads the master video file
- *     directly to R2 — the large file never passes through this server
- *     (getUploadUrl, random per-upload key).
- *  2. A presigned PUT URL for a FIXED key — used for assets that should
- *     always be overwritten in place rather than versioned, so their
- *     public URL never changes (getFixedUploadUrl; currently used for
- *     the Android APK release asset, uploaded by film-frontend's
- *     build-apk.yml workflow).
- *  3. Uploading small in-memory content (the VTT captions file) right
- *     after Deepgram generates it.
+ * Cloudflare R2 helper functions used OUTSIDE the multi-provider storage
+ * router: uploading the small VTT captions file, and presigning the
+ * Android APK's fixed-key release asset (see
+ * controllers/serviceController.js's getApkUploadUrl). Own-upload film
+ * masters no longer call this file directly — see services/storageRouter.js
+ * + adapters/R2Adapter.js, which wraps getFixedUploadUrl() / getPublicUrl()
+ * / deleteObject() below to satisfy the shared StorageAdapter interface
+ * alongside B2Adapter/StorjAdapter.
  *
- * Downloading/processing the master file and uploading the resulting
- * thumbnail/preview lives entirely on the heavy backend (a separate
- * repo, its own R2 credentials) — this file deliberately doesn't do that,
- * to keep this backend from ever handling large file bytes.
+ * (The old random-key getUploadUrl()/buildKey() functions that used to
+ * live here were removed — storageRouter.js now owns key generation for
+ * routed uploads, and nothing else called them.)
  */
 
-const crypto = require("crypto");
-const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
+const { S3Client, PutObjectCommand, DeleteObjectCommand } = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 
 const R2_ACCOUNT_ID = process.env.R2_ACCOUNT_ID;
@@ -69,21 +63,12 @@ function getPublicUrl(key) {
 }
 
 /**
- * Builds a collision-safe object key from a user-supplied filename —
- * strips anything that isn't a safe filename character and prefixes with
- * a random UUID so two uploads of "video.mp4" never collide.
+ * Generates a presigned PUT URL for a caller-supplied FIXED key — used
+ * when the same object should always be overwritten in place: the
+ * Android APK release asset, and (via R2Adapter) every own-upload film
+ * master routed to R2, so its public URL never changes between uploads.
  */
-function buildKey(filename) {
-  const safeName = String(filename || "upload").replace(/[^a-zA-Z0-9._-]/g, "_");
-  return `uploads/${crypto.randomUUID()}-${safeName}`;
-}
-
-/**
- * Shared presign logic. The only difference between getUploadUrl and
- * getFixedUploadUrl below is where `key` comes from — a freshly generated
- * random one, vs a caller-supplied fixed one.
- */
-async function presignPut(key, contentType) {
+async function getFixedUploadUrl(key, contentType) {
   const bucket = requireBucket();
   const c = getClient();
 
@@ -101,29 +86,12 @@ async function presignPut(key, contentType) {
 }
 
 /**
- * Generates a presigned PUT URL the browser can upload directly to, under
- * a fresh random key. Returns the key so the caller can reference this
- * object later, and the eventual public URL for convenience.
- */
-async function getUploadUrl(filename, contentType) {
-  const key = buildKey(filename);
-  return presignPut(key, contentType);
-}
-
-/**
- * Like getUploadUrl, but for a caller-supplied FIXED key instead of a
- * randomly generated one — used when the same object should always be
- * overwritten in place (e.g. the Android APK release asset), so its
- * public URL never changes between uploads/builds.
- */
-async function getFixedUploadUrl(key, contentType) {
-  return presignPut(key, contentType);
-}
-
-/**
  * Uploads content directly from memory (string or Buffer) — used for the
  * VTT captions file, which is small enough that writing a temp file first
- * would just be unnecessary overhead.
+ * would just be unnecessary overhead. Captions always live on R2
+ * regardless of which provider a film's master landed on — they're tiny
+ * text files, not worth routing, and keeping them in one place simplifies
+ * lookup.
  */
 async function uploadBuffer(key, body, contentType) {
   const bucket = requireBucket();
@@ -141,10 +109,19 @@ async function uploadBuffer(key, body, contentType) {
   return getPublicUrl(key);
 }
 
+/**
+ * Deletes an object from R2 — used by R2Adapter.delete() to satisfy the
+ * shared StorageAdapter interface.
+ */
+async function deleteObject(key) {
+  const bucket = requireBucket();
+  const c = getClient();
+  await c.send(new DeleteObjectCommand({ Bucket: bucket, Key: key }));
+}
+
 module.exports = {
-  getUploadUrl,
   getFixedUploadUrl,
   uploadBuffer,
   getPublicUrl,
-  buildKey,
+  deleteObject,
 };

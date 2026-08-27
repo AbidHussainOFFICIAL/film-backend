@@ -5,7 +5,7 @@
  * a film — useful if the original dispatch failed, or the callback never
  * arrived (e.g. the callback secret was misconfigured, or the tunnel URL
  * used for local testing had already expired). Doesn't re-upload anything
- * — the master file is already sitting in R2 under the film's masterKey.
+ * — the master file is already sitting with its recorded storageProvider.
  *
  * Run: node scripts/triggerMediaProcessing.js <filmId>
  */
@@ -18,7 +18,12 @@ dns.setServers(["8.8.8.8", "8.8.4.4"]);
 
 const mongoose = require("mongoose");
 const Film = require("../models/Film");
-const { triggerMediaProcessing } = require("../services/githubActions");
+// NOTE: this used to import a function called `triggerMediaProcessing`,
+// which doesn't exist in services/githubActions.js (only
+// `triggerUploadProcessing` does) — a pre-existing bug that would have
+// thrown at runtime the first time this script was actually run. Fixed
+// here while adding storageProvider support.
+const { triggerUploadProcessing } = require("../services/githubActions");
 
 const MONGO_URI = process.env.MONGO_URI;
 const filmId = process.argv[2];
@@ -38,12 +43,13 @@ async function run() {
   const film = await Film.findById(filmId);
   if (!film) throw new Error(`Film ${filmId} not found`);
   if (!film.masterKey) throw new Error(`Film ${filmId} has no masterKey`);
+  if (!film.storageProvider) throw new Error(`Film ${filmId} has no storageProvider recorded`);
 
-  await triggerMediaProcessing(film._id, film.masterKey);
+  await triggerUploadProcessing(film._id, film.masterKey, film.storageProvider);
   film.transcodeStatus = "processing";
   await film.save();
 
-  console.log(`Dispatched media processing for "${film.title}" (${film._id}).`);
+  console.log(`Dispatched media processing for "${film.title}" (${film._id}) on ${film.storageProvider}.`);
   console.log(
     "Check the film-media-worker repo's Actions tab for the run, and MongoDB once the callback lands."
   );
@@ -55,3 +61,4 @@ run()
     console.error("Failed to trigger media processing:", err.message);
     mongoose.disconnect().finally(() => process.exit(1));
   });
+  

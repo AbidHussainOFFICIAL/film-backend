@@ -24,6 +24,7 @@ const adminRoutes = require("./routes/adminRoutes");
 const searchRoutes = require("./routes/searchRoutes");
 const jobsRoutes = require("./routes/jobsRoutes");
 const serviceRoutes = require("./routes/serviceRoutes");
+const providerRoutes = require("./routes/providerRoutes");
 const { connectWhatsApp } = require("./services/whatsapp");
 
 const app = express();
@@ -63,6 +64,7 @@ app.use("/api/admin", adminRoutes);
 app.use("/api/search", searchRoutes);
 app.use("/api/admin/jobs", jobsRoutes);
 app.use("/api/service", serviceRoutes);
+app.use("/api/admin/providers", providerRoutes);
 
 // 404 fallback
 app.use((req, res) => {
