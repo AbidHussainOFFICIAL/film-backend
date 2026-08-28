@@ -45,6 +45,14 @@ function getClient() {
         accessKeyId: R2_ACCESS_KEY_ID,
         secretAccessKey: R2_SECRET_ACCESS_KEY,
       },
+      // Newer @aws-sdk/client-s3 versions default to always computing a
+      // request checksum, which gets embedded as extra query params
+      // (x-amz-checksum-crc32 etc.) on presigned URLs. R2 (and most
+      // non-AWS S3-compatible providers) doesn't reliably support this —
+      // it can cause a SignatureDoesNotMatch failure on the actual PUT
+      // even after CORS is configured correctly. "WHEN_REQUIRED" matches
+      // the SDK's older, safer default behavior.
+      requestChecksumCalculation: "WHEN_REQUIRED",
     });
   }
   return client;

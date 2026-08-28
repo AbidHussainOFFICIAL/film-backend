@@ -53,6 +53,10 @@ class StorjAdapter extends StorageAdapter {
         // Storj's gateway expects the bucket in the path, not as a
         // virtual-hosted subdomain of the endpoint.
         forcePathStyle: true,
+        // See storage.js's identical comment — newer AWS SDK versions
+        // default to auto-computing a request checksum that most
+        // non-AWS S3-compatible providers don't reliably support.
+        requestChecksumCalculation: "WHEN_REQUIRED",
       });
     }
     return this._client;
