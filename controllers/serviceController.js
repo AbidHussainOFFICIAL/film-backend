@@ -146,7 +146,11 @@ async function handleUploadCallback(req, res) {
 
     if (status === "running") {
       film.transcodeStatus = "processing";
-    } else if (status === "completed") {
+      await film.save();
+      return res.json({ ok: true });
+    }
+
+    if (status === "completed") {
       if (!thumbKey || !previewKey) {
         return res.status(400).json({ error: "Missing thumbKey/previewKey for a completed callback" });
       }
@@ -175,65 +179,90 @@ async function handleUploadCallback(req, res) {
       // this by choosing to upload it in the first place.
       film.status = "approved";
       film.verifiedDate = new Date();
-    } else {
-      film.transcodeStatus = "failed";
-      console.error(`Media processing reported failure for film ${id}:`, error || "(no error message provided)");
-      // Centralized capture point for process-upload.yml's failures — that
-      // workflow is pure bash/ffmpeg, it has no way to call Sentry itself,
-      // so this callback is the only place its failures become visible.
-      Sentry.captureMessage(`Upload processing failed for film ${id}: ${error || "no error message"}`, "error");
+      await film.save();
+
+      // Respond to the caller (process-upload.yml's "Report success to
+      // backend" step) immediately, right after the film update is
+      // safely persisted — do NOT make that curl call wait on Telegram,
+      // WhatsApp, or the Archive.org backup below. Those can legitimately
+      // take anywhere from seconds to several minutes (WhatsApp in
+      // particular can hang far longer than that if its persistent
+      // session isn't currently live — see services/whatsapp.js), and a
+      // slow/hung side effect here should never be able to make CI think
+      // the whole upload failed when the film itself already saved fine.
+      res.json({ ok: true });
+
+      runPostApprovalSideEffects(film).catch((err) => {
+        // Should be unreachable — every branch inside already catches
+        // its own errors — but guards against anything unexpected
+        // slipping through as a genuinely unhandled rejection.
+        console.error(`Unexpected error in post-approval side effects for film ${id}:`, err.message);
+        Sentry.captureException(err);
+      });
+      return;
     }
 
+    // status === "failed"
+    film.transcodeStatus = "failed";
+    console.error(`Media processing reported failure for film ${id}:`, error || "(no error message provided)");
+    // Centralized capture point for process-upload.yml's failures — that
+    // workflow is pure bash/ffmpeg, it has no way to call Sentry itself,
+    // so this callback is the only place its failures become visible.
+    Sentry.captureMessage(`Upload processing failed for film ${id}: ${error || "no error message"}`, "error");
     await film.save();
-
-    // Own-upload just auto-approved — post it, same best-effort pattern
-    // as the manual-approval path in adminController.js.
-    if (status === "completed") {
-      try {
-        await postFilmToTelegram(film);
-      } catch (telegramErr) {
-        console.error(`Telegram post failed for film ${id}:`, telegramErr.message);
-        Sentry.captureException(telegramErr);
-      }
-
-      try {
-        await postFilmToChannel(film);
-      } catch (whatsappErr) {
-        console.error(`WhatsApp post failed for film ${id}:`, whatsappErr.message);
-        Sentry.captureException(whatsappErr);
-      }
-
-      // Best-effort insurance mirror — a failure here doesn't affect
-      // anything else; the film is already fully playable from its own
-      // storage provider regardless of whether this succeeds. See
-      // services/archiveBackup.js for the important caveat about this
-      // integration not yet being exercised against a live account.
-      try {
-        const identifier = await backupFilmToArchiveOrg(film);
-        film.archiveBackup = {
-          pushed: true,
-          archiveIdentifier: identifier,
-          pushedDate: new Date(),
-          status: "completed",
-        };
-        await film.save();
-      } catch (archiveErr) {
-        console.error(`Archive.org backup failed for film ${id}:`, archiveErr.message);
-        Sentry.captureException(archiveErr);
-        film.archiveBackup = {
-          pushed: false,
-          status: "failed",
-          error: archiveErr.message,
-        };
-        await film.save().catch(() => {});
-      }
-    }
-
-    res.json({ ok: true });
+    return res.json({ ok: true });
   } catch (err) {
     console.error("Error handling upload callback:", err);
     Sentry.captureException(err);
     res.status(500).json({ error: "Failed to process callback" });
+  }
+}
+
+// Runs AFTER the callback has already responded — see the comment above
+// where this is invoked. Every step here keeps its own try/catch, same
+// best-effort pattern as adminController.approveFilm's equivalent side
+// effects; the only difference here is that nothing awaits this function
+// before responding to the request that triggered it.
+async function runPostApprovalSideEffects(film) {
+  const id = film._id;
+
+  try {
+    await postFilmToTelegram(film);
+  } catch (telegramErr) {
+    console.error(`Telegram post failed for film ${id}:`, telegramErr.message);
+    Sentry.captureException(telegramErr);
+  }
+
+  try {
+    await postFilmToChannel(film);
+  } catch (whatsappErr) {
+    console.error(`WhatsApp post failed for film ${id}:`, whatsappErr.message);
+    Sentry.captureException(whatsappErr);
+  }
+
+  // Best-effort insurance mirror — a failure here doesn't affect anything
+  // else; the film is already fully playable from its own storage
+  // provider regardless of whether this succeeds. See
+  // services/archiveBackup.js for the important caveat about this
+  // integration not yet being exercised against a live account.
+  try {
+    const identifier = await backupFilmToArchiveOrg(film);
+    film.archiveBackup = {
+      pushed: true,
+      archiveIdentifier: identifier,
+      pushedDate: new Date(),
+      status: "completed",
+    };
+    await film.save();
+  } catch (archiveErr) {
+    console.error(`Archive.org backup failed for film ${id}:`, archiveErr.message);
+    Sentry.captureException(archiveErr);
+    film.archiveBackup = {
+      pushed: false,
+      status: "failed",
+      error: archiveErr.message,
+    };
+    await film.save().catch(() => {});
   }
 }
 
