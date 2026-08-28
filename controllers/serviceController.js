@@ -3,6 +3,7 @@
 const Sentry = require("@sentry/node");
 const Film = require("../models/Film");
 const JobRun = require("../models/JobRun");
+const Provider = require("../models/Provider");
 const filmService = require("../services/filmService");
 const ingestionService = require("../services/ingestionService");
 const storage = require("../services/storage");
@@ -203,6 +204,13 @@ async function handleUploadCallback(req, res) {
     }
 
     // status === "failed"
+    // Capture whether this film was ALREADY marked failed before this
+    // callback — if so, its reserved capacity was already released the
+    // first time (see below), and a retry that fails again must not
+    // release it a second time for a slot that was only ever reserved
+    // once.
+    const alreadyMarkedFailed = film.transcodeStatus === "failed";
+
     film.transcodeStatus = "failed";
     console.error(`Media processing reported failure for film ${id}:`, error || "(no error message provided)");
     // Centralized capture point for process-upload.yml's failures — that
@@ -210,6 +218,25 @@ async function handleUploadCallback(req, res) {
     // so this callback is the only place its failures become visible.
     Sentry.captureMessage(`Upload processing failed for film ${id}: ${error || "no error message"}`, "error");
     await film.save();
+
+    // Release the capacity reserved for this upload back to its
+    // provider — storageRouter.reserveUploadSlot() increments usedBytes
+    // optimistically, before processing even starts, so a failed run
+    // must give that space back rather than permanently consuming quota
+    // for a file that was never actually stored successfully.
+    if (!alreadyMarkedFailed && film.storageProvider && typeof film.fileSizeBytes === "number") {
+      await Provider.updateOne(
+        { name: film.storageProvider },
+        { $inc: { usedBytes: -film.fileSizeBytes } }
+      ).catch((releaseErr) => {
+        console.error(
+          `Failed to release reserved capacity for provider ${film.storageProvider} (film ${id}):`,
+          releaseErr.message
+        );
+        Sentry.captureException(releaseErr);
+      });
+    }
+
     return res.json({ ok: true });
   } catch (err) {
     console.error("Error handling upload callback:", err);

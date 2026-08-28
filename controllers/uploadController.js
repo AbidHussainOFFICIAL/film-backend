@@ -2,6 +2,7 @@
 
 const Sentry = require("@sentry/node");
 const Film = require("../models/Film");
+const Provider = require("../models/Provider");
 const storage = require("../services/storage");
 const storageRouter = require("../services/storageRouter");
 const { getAdapter } = require("../services/adapterRegistry");
@@ -137,6 +138,25 @@ async function createUpload(req, res) {
       Sentry.captureException(dispatchErr);
       film.transcodeStatus = "failed";
       await film.save();
+
+      // The dispatch itself failed, so process-upload.yml never ran —
+      // meaning serviceController.js's callback-based capacity release
+      // never fires for this film either. Release the reservation here
+      // instead, so a dispatch failure (bad GITHUB_PAT, GitHub API
+      // hiccup, etc.) doesn't permanently consume quota for a file that
+      // was never actually processed.
+      if (typeof film.fileSizeBytes === "number") {
+        await Provider.updateOne(
+          { name: storageProvider },
+          { $inc: { usedBytes: -film.fileSizeBytes } }
+        ).catch((releaseErr) => {
+          console.error(
+            `Failed to release reserved capacity for provider ${storageProvider} (film ${film._id}):`,
+            releaseErr.message
+          );
+          Sentry.captureException(releaseErr);
+        });
+      }
     }
 
     res.status(201).json(film);
