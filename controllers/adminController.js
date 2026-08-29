@@ -6,6 +6,15 @@ const { getEmbedding, buildEmbeddingText } = require("../services/embedding");
 const { upsertFilmEmbedding, deleteFilmEmbedding } = require("../services/qdrantService");
 const { postFilmToTelegram } = require("../services/telegram");
 const { postFilmToChannel } = require("../services/whatsapp");
+const { withTimeout } = require("../utils/withTimeout");
+
+// Hard ceiling for each best-effort post-approval side effect — see
+// utils/withTimeout.js for why this matters: a try/catch alone only
+// protects against a THROW, not a HANG (WhatsApp's postFilmToChannel in
+// particular can hang indefinitely if its persistent session isn't
+// currently live, since its initial connection-establishment step has no
+// timeout of its own).
+const SIDE_EFFECT_TIMEOUT_MS = 6 * 60 * 1000; // 6 minutes
 
 const VALID_STATUSES = ["pending", "approved", "rejected"];
 
@@ -82,24 +91,28 @@ async function runPostApprovalSideEffects(film) {
     Sentry.captureException(embedErr);
   }
 
-  // Post to the Telegram channel. Best-effort — a failure here (bad
-  // bot token, self-hosted server down, channel permissions) shouldn't
-  // undo the approval, it just means this title didn't get announced.
+  // Post to the WhatsApp channel first — ordered ahead of Telegram to
+  // match the priority used in serviceController.js's equivalent chain
+  // (Archive.org, then WhatsApp, then Telegram there — there's no
+  // Archive.org step here, since that only applies to own-uploads).
+  // Best-effort — a failure here (not paired, channel JID wrong)
+  // shouldn't undo the approval.
   try {
-    await postFilmToTelegram(film);
-  } catch (telegramErr) {
-    console.error(`Telegram post failed for film ${film._id}:`, telegramErr.message);
-    Sentry.captureException(telegramErr);
-  }
-
-  // Post to the WhatsApp channel. Best-effort like Telegram — a
-  // failure here (not paired, channel JID wrong) shouldn't undo the
-  // approval.
-  try {
-    await postFilmToChannel(film);
+    await withTimeout(postFilmToChannel(film), SIDE_EFFECT_TIMEOUT_MS, "WhatsApp post");
   } catch (whatsappErr) {
     console.error(`WhatsApp post failed for film ${film._id}:`, whatsappErr.message);
     Sentry.captureException(whatsappErr);
+  }
+
+  // Post to the Telegram channel. Best-effort like WhatsApp — a failure
+  // here (bad bot token, self-hosted server down, channel permissions)
+  // shouldn't undo the approval, it just means this title didn't get
+  // announced.
+  try {
+    await withTimeout(postFilmToTelegram(film), SIDE_EFFECT_TIMEOUT_MS, "Telegram post");
+  } catch (telegramErr) {
+    console.error(`Telegram post failed for film ${film._id}:`, telegramErr.message);
+    Sentry.captureException(telegramErr);
   }
 }
 

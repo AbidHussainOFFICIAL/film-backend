@@ -11,6 +11,15 @@ const { getAdapter } = require("../services/adapterRegistry");
 const { postFilmToTelegram } = require("../services/telegram");
 const { postFilmToChannel } = require("../services/whatsapp");
 const { backupFilmToArchiveOrg } = require("../services/archiveBackup");
+const { withTimeout } = require("../utils/withTimeout");
+
+// Hard ceiling for each best-effort post-approval side effect. Generous
+// enough that Telegram/WhatsApp/Archive.org's own internal timeouts fire
+// first in the normal case — this is a safety net for the one gap those
+// internals don't cover (WhatsApp's initial connection-establishment
+// await, which has no timeout of its own), so a hang there can never
+// again silently block every step scheduled after it.
+const SIDE_EFFECT_TIMEOUT_MS = 6 * 60 * 1000; // 6 minutes
 
 // Fixed R2 key for the Android APK release asset — always overwritten in
 // place by film-frontend's build-apk.yml workflow, so the public download
@@ -253,27 +262,18 @@ async function handleUploadCallback(req, res) {
 async function runPostApprovalSideEffects(film) {
   const id = film._id;
 
+  // Archive.org backup runs FIRST — deliberately ordered ahead of
+  // WhatsApp/Telegram so a hung or slow WhatsApp connection (see
+  // services/whatsapp.js's header comment) can never delay this
+  // permanent-record backup. Best-effort like the rest — a failure here
+  // doesn't affect anything else; the film is already fully playable
+  // from its own storage provider regardless of whether this succeeds.
   try {
-    await postFilmToTelegram(film);
-  } catch (telegramErr) {
-    console.error(`Telegram post failed for film ${id}:`, telegramErr.message);
-    Sentry.captureException(telegramErr);
-  }
-
-  try {
-    await postFilmToChannel(film);
-  } catch (whatsappErr) {
-    console.error(`WhatsApp post failed for film ${id}:`, whatsappErr.message);
-    Sentry.captureException(whatsappErr);
-  }
-
-  // Best-effort insurance mirror — a failure here doesn't affect anything
-  // else; the film is already fully playable from its own storage
-  // provider regardless of whether this succeeds. See
-  // services/archiveBackup.js for the important caveat about this
-  // integration not yet being exercised against a live account.
-  try {
-    const identifier = await backupFilmToArchiveOrg(film);
+    const identifier = await withTimeout(
+      backupFilmToArchiveOrg(film),
+      SIDE_EFFECT_TIMEOUT_MS,
+      "Archive.org backup"
+    );
     film.archiveBackup = {
       pushed: true,
       archiveIdentifier: identifier,
@@ -290,6 +290,20 @@ async function runPostApprovalSideEffects(film) {
       error: archiveErr.message,
     };
     await film.save().catch(() => {});
+  }
+
+  try {
+    await withTimeout(postFilmToChannel(film), SIDE_EFFECT_TIMEOUT_MS, "WhatsApp post");
+  } catch (whatsappErr) {
+    console.error(`WhatsApp post failed for film ${id}:`, whatsappErr.message);
+    Sentry.captureException(whatsappErr);
+  }
+
+  try {
+    await withTimeout(postFilmToTelegram(film), SIDE_EFFECT_TIMEOUT_MS, "Telegram post");
+  } catch (telegramErr) {
+    console.error(`Telegram post failed for film ${id}:`, telegramErr.message);
+    Sentry.captureException(telegramErr);
   }
 }
 
