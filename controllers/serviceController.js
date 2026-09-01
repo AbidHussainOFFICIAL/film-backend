@@ -11,15 +11,8 @@ const { getAdapter } = require("../services/adapterRegistry");
 const { postFilmToTelegram } = require("../services/telegram");
 const { postFilmToChannel } = require("../services/whatsapp");
 const { backupFilmToArchiveOrg } = require("../services/archiveBackup");
+const { incrementCategoryCounts } = require("../services/categoryService");
 const { withTimeout } = require("../utils/withTimeout");
-
-// Hard ceiling for each best-effort post-approval side effect. Generous
-// enough that Telegram/WhatsApp/Archive.org's own internal timeouts fire
-// first in the normal case — this is a safety net for the one gap those
-// internals don't cover (WhatsApp's initial connection-establishment
-// await, which has no timeout of its own), so a hang there can never
-// again silently block every step scheduled after it.
-const SIDE_EFFECT_TIMEOUT_MS = 6 * 60 * 1000; // 6 minutes
 
 // Fixed R2 key for the Android APK release asset — always overwritten in
 // place by film-frontend's build-apk.yml workflow, so the public download
@@ -27,6 +20,12 @@ const SIDE_EFFECT_TIMEOUT_MS = 6 * 60 * 1000; // 6 minutes
 // ever needs to move (e.g. a bucket reorganization).
 const APK_STORAGE_KEY = process.env.APK_STORAGE_KEY || "releases/reel-vault.apk";
 const APK_CONTENT_TYPE = "application/vnd.android.package-archive";
+
+// Hard ceiling for each best-effort post-approval side effect. See
+// utils/withTimeout.js — a try/catch alone only protects against a
+// THROW, not a HANG (WhatsApp's postFilmToChannel in particular can
+// hang indefinitely if its persistent session isn't currently live).
+const SIDE_EFFECT_TIMEOUT_MS = 6 * 60 * 1000; // 6 minutes
 
 // ---------------------------------------------------------------------
 // Films — used by the ingest.yml and qdrant-reindex.yml workflows
@@ -83,8 +82,61 @@ async function listFilmsForEmbedding(req, res) {
   }
 }
 
+// GET /api/service/films/for-link-check
+// Used by film-media-worker's checkLinks.js — returns just enough for the
+// heavy backend to HEAD-check every approved film's stream URL, without
+// exposing anything else about the film.
+async function listFilmsForLinkCheck(req, res) {
+  try {
+    const films = await Film.find(
+      { status: "approved", streamUrl: { $exists: true, $ne: null } },
+      { streamUrl: 1 }
+    );
+    res.json(films.map((f) => ({ filmId: f._id, streamUrl: f.streamUrl })));
+  } catch (err) {
+    console.error("Error listing films for link check:", err);
+    Sentry.captureException(err);
+    res.status(500).json({ error: "Failed to list films for link check" });
+  }
+}
+
+// POST /api/service/films/link-health-batch
+// Body: { results: [{ filmId, isHealthy, lastError? }] }
+// Called once at the end of a checkLinks.js run with every result, rather
+// than one request per film — cheaper and means a partial network blip
+// mid-run can't leave some films updated and others not.
+async function reportLinkHealthBatch(req, res) {
+  try {
+    const { results = [] } = req.body;
+    const now = new Date();
+
+    const operations = results.map((r) => ({
+      updateOne: {
+        filter: { _id: r.filmId },
+        update: {
+          $set: {
+            "linkHealth.lastChecked": now,
+            "linkHealth.isHealthy": !!r.isHealthy,
+            "linkHealth.lastError": r.isHealthy ? undefined : r.lastError || "Unknown error",
+          },
+        },
+      },
+    }));
+
+    if (operations.length > 0) {
+      await Film.bulkWrite(operations);
+    }
+
+    res.json({ ok: true, updated: operations.length });
+  } catch (err) {
+    console.error("Error reporting link health batch:", err);
+    Sentry.captureException(err);
+    res.status(500).json({ error: "Failed to report link health batch" });
+  }
+}
+
 // ---------------------------------------------------------------------
-// Jobs — generic status reporting for ingest/qdrant-reindex JobRuns
+// Jobs — generic status reporting for ingest/qdrant-reindex/link-check JobRuns
 // ---------------------------------------------------------------------
 
 // POST /api/service/jobs/:id/start
@@ -121,9 +173,10 @@ async function completeJob(req, res) {
     if (!job) return res.status(404).json({ error: "JobRun not found" });
 
     // The heavy backend reported this job as failed — capture it here
-    // centrally, since ingest.js/qdrantReindex.js scripts don't have
-    // their own guaranteed-delivery way to report to Sentry directly
-    // (a crash before their own capture code runs would go unseen).
+    // centrally, since ingest.js/qdrantReindex.js/checkLinks.js scripts
+    // don't have their own guaranteed-delivery way to report to Sentry
+    // directly (a crash before their own capture code runs would go
+    // unseen).
     if (status === "failed") {
       Sentry.captureMessage(`JobRun ${job._id} (${job.type}) failed: ${error || "no error message"}`, "error");
     }
@@ -255,19 +308,19 @@ async function handleUploadCallback(req, res) {
 }
 
 // Runs AFTER the callback has already responded — see the comment above
-// where this is invoked. Every step here keeps its own try/catch, same
-// best-effort pattern as adminController.approveFilm's equivalent side
-// effects; the only difference here is that nothing awaits this function
-// before responding to the request that triggered it.
+// where this is invoked. Every step here keeps its own try/catch, so a
+// failure in one never affects the approval that already succeeded in
+// Mongo, and never blocks the steps after it (see utils/withTimeout.js).
 async function runPostApprovalSideEffects(film) {
   const id = film._id;
 
-  // Archive.org backup runs FIRST — deliberately ordered ahead of
-  // WhatsApp/Telegram so a hung or slow WhatsApp connection (see
-  // services/whatsapp.js's header comment) can never delay this
-  // permanent-record backup. Best-effort like the rest — a failure here
-  // doesn't affect anything else; the film is already fully playable
-  // from its own storage provider regardless of whether this succeeds.
+  // Fast, synchronous, no external network call — runs first and
+  // unconditionally, no timeout needed.
+  await incrementCategoryCounts(film.category);
+
+  // Archive.org backup runs next — deliberately ordered ahead of
+  // WhatsApp/Telegram so a hung or slow WhatsApp connection can never
+  // delay this permanent-record backup. Best-effort like the rest.
   try {
     const identifier = await withTimeout(
       backupFilmToArchiveOrg(film),
@@ -294,16 +347,24 @@ async function runPostApprovalSideEffects(film) {
 
   try {
     await withTimeout(postFilmToChannel(film), SIDE_EFFECT_TIMEOUT_MS, "WhatsApp post");
+    film.whatsappPost = { pushed: true, status: "completed", pushedDate: new Date() };
+    await film.save().catch(() => {});
   } catch (whatsappErr) {
     console.error(`WhatsApp post failed for film ${id}:`, whatsappErr.message);
     Sentry.captureException(whatsappErr);
+    film.whatsappPost = { pushed: false, status: "failed", error: whatsappErr.message };
+    await film.save().catch(() => {});
   }
 
   try {
     await withTimeout(postFilmToTelegram(film), SIDE_EFFECT_TIMEOUT_MS, "Telegram post");
+    film.telegramPost = { pushed: true, status: "completed", pushedDate: new Date() };
+    await film.save().catch(() => {});
   } catch (telegramErr) {
     console.error(`Telegram post failed for film ${id}:`, telegramErr.message);
     Sentry.captureException(telegramErr);
+    film.telegramPost = { pushed: false, status: "failed", error: telegramErr.message };
+    await film.save().catch(() => {});
   }
 }
 
@@ -312,11 +373,6 @@ async function runPostApprovalSideEffects(film) {
 // ---------------------------------------------------------------------
 
 // GET /api/service/apk/upload-url
-// Returns a presigned PUT URL for a FIXED R2 key (not a random one, unlike
-// the admin upload flow) — every new build overwrites the same object, so
-// the frontend's public download link (see /download/android) never needs
-// to change between builds. Caller uploads the .apk bytes directly to R2
-// with this URL; this server's own bytes are never touched.
 async function getApkUploadUrl(req, res) {
   try {
     const result = await storage.getFixedUploadUrl(APK_STORAGE_KEY, APK_CONTENT_TYPE);
@@ -332,6 +388,8 @@ module.exports = {
   checkExistingFilms,
   ingestBatch,
   listFilmsForEmbedding,
+  listFilmsForLinkCheck,
+  reportLinkHealthBatch,
   startJob,
   completeJob,
   handleUploadCallback,

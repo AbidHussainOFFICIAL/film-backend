@@ -16,6 +16,16 @@ async function getFilmsByStatus(status) {
   return Film.find({ status }).sort({ addedDate: -1 });
 }
 
+// Approved films whose last link-health check came back unhealthy — see
+// scripts/checkLinks.js (runs weekly via film-media-worker). Only ever
+// meaningful for approved films: pending/rejected films are never
+// stream-checked in the first place.
+async function getUnhealthyFilms() {
+  return Film.find({ status: "approved", "linkHealth.isHealthy": false }).sort({
+    "linkHealth.lastChecked": -1,
+  });
+}
+
 async function setFilmStatus(id, status, extra = {}) {
   return Film.findByIdAndUpdate(
     id,
@@ -44,6 +54,7 @@ module.exports = {
   getApprovedFilms,
   getFilmById,
   getFilmsByStatus,
+  getUnhealthyFilms,
   setFilmStatus,
   getFilmsByIds,
   getFilmsForEmbedding,

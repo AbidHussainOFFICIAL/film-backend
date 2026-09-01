@@ -14,6 +14,11 @@ router.post("/films/check-existing", serviceController.checkExistingFilms);
 router.post("/films/ingest-batch", serviceController.ingestBatch);
 router.get("/films/for-embedding", serviceController.listFilmsForEmbedding);
 
+// GET /api/service/films/for-link-check + POST .../link-health-batch —
+// used by film-media-worker's checkLinks.js (weekly link-health sweep).
+router.get("/films/for-link-check", serviceController.listFilmsForLinkCheck);
+router.post("/films/link-health-batch", serviceController.reportLinkHealthBatch);
+
 router.post("/jobs/:id/start", serviceController.startJob);
 router.post("/jobs/:id/complete", serviceController.completeJob);
 

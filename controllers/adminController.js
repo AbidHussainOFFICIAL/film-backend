@@ -6,6 +6,7 @@ const { getEmbedding, buildEmbeddingText } = require("../services/embedding");
 const { upsertFilmEmbedding, deleteFilmEmbedding } = require("../services/qdrantService");
 const { postFilmToTelegram } = require("../services/telegram");
 const { postFilmToChannel } = require("../services/whatsapp");
+const { incrementCategoryCounts } = require("../services/categoryService");
 const { withTimeout } = require("../utils/withTimeout");
 
 // Hard ceiling for each best-effort post-approval side effect — see
@@ -31,6 +32,22 @@ async function listFilmsByStatus(req, res) {
     console.error("Error listing films by status:", err);
     Sentry.captureException(err);
     res.status(500).json({ error: "Failed to fetch films" });
+  }
+}
+
+// GET /api/admin/films/unhealthy
+// Approved films whose last link-health check (see
+// scripts/checkLinks.js, run weekly) came back unhealthy — surfaced
+// separately from the pending queue since these need a different kind
+// of review (a dead link, not a moderation decision).
+async function listUnhealthyFilms(req, res) {
+  try {
+    const films = await filmService.getUnhealthyFilms();
+    res.json(films);
+  } catch (err) {
+    console.error("Error listing unhealthy films:", err);
+    Sentry.captureException(err);
+    res.status(500).json({ error: "Failed to fetch unhealthy films" });
   }
 }
 
@@ -75,6 +92,10 @@ async function approveFilm(req, res) {
 // failure in one (or all three) never affects the approval that already
 // succeeded in Mongo.
 async function runPostApprovalSideEffects(film) {
+  // Fast, synchronous, no external network call — runs first and
+  // unconditionally, no timeout needed.
+  await incrementCategoryCounts(film.category);
+
   // Index into Qdrant for semantic search. Best-effort: the film is
   // already approved in Mongo at this point, so a failure here (missing
   // API key, Nomic/Qdrant hiccup) shouldn't roll that back — it just
@@ -99,9 +120,13 @@ async function runPostApprovalSideEffects(film) {
   // shouldn't undo the approval.
   try {
     await withTimeout(postFilmToChannel(film), SIDE_EFFECT_TIMEOUT_MS, "WhatsApp post");
+    film.whatsappPost = { pushed: true, status: "completed", pushedDate: new Date() };
+    await film.save().catch(() => {});
   } catch (whatsappErr) {
     console.error(`WhatsApp post failed for film ${film._id}:`, whatsappErr.message);
     Sentry.captureException(whatsappErr);
+    film.whatsappPost = { pushed: false, status: "failed", error: whatsappErr.message };
+    await film.save().catch(() => {});
   }
 
   // Post to the Telegram channel. Best-effort like WhatsApp — a failure
@@ -110,9 +135,13 @@ async function runPostApprovalSideEffects(film) {
   // announced.
   try {
     await withTimeout(postFilmToTelegram(film), SIDE_EFFECT_TIMEOUT_MS, "Telegram post");
+    film.telegramPost = { pushed: true, status: "completed", pushedDate: new Date() };
+    await film.save().catch(() => {});
   } catch (telegramErr) {
     console.error(`Telegram post failed for film ${film._id}:`, telegramErr.message);
     Sentry.captureException(telegramErr);
+    film.telegramPost = { pushed: false, status: "failed", error: telegramErr.message };
+    await film.save().catch(() => {});
   }
 }
 
@@ -145,6 +174,7 @@ async function rejectFilm(req, res) {
 
 module.exports = {
   listFilmsByStatus,
+  listUnhealthyFilms,
   approveFilm,
   rejectFilm,
 };

@@ -2,6 +2,7 @@
 
 const Film = require("../models/Film");
 const IngestionLog = require("../models/IngestionLog");
+const { mapToTaxonomy } = require("./categoryMapper");
 
 /**
  * Given candidate identifiers/hashes the heavy backend found on
@@ -25,6 +26,12 @@ async function checkExisting(identifiers = [], hashes = []) {
  * ingestion run. Idempotent — relies on Film's unique+sparse indexes on
  * archiveIdentifier/fileHash to catch any race-condition duplicates that
  * slipped past the heavy backend's own checkExisting call.
+ *
+ * category is mapped through the fixed taxonomy here — TMDb's raw genre
+ * strings aren't guaranteed to match it exactly, and the heavy backend
+ * doesn't have access to this mapping logic (it's a separate repo), so
+ * this is the one place that guarantee actually gets enforced for
+ * archive.org-sourced films.
  */
 async function insertBatch(films = []) {
   let inserted = 0;
@@ -34,7 +41,11 @@ async function insertBatch(films = []) {
 
   for (const film of films) {
     try {
-      await Film.create({ ...film, status: "pending" });
+      await Film.create({
+        ...film,
+        category: mapToTaxonomy(film.category),
+        status: "pending",
+      });
       inserted += 1;
     } catch (err) {
       if (err?.code === 11000) {

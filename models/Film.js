@@ -19,13 +19,30 @@ const licenseSchema = new Schema(
   { _id: false }
 );
 
+// Telegram/WhatsApp delivery status — deliberately the SAME field shape
+// as archiveBackup below (pushed/pushedDate/status/error), just without
+// archiveBackup's extra archiveIdentifier field (Telegram/WhatsApp don't
+// have an equivalent "which remote item is this" reference to track).
+// Kept as its own schema rather than trying to force all three channels
+// to literally share one schema object — archiveBackup's shape has been
+// live in production since Slice 10 and must not change.
+const channelPostSchema = new Schema(
+  {
+    pushed: { type: Boolean, default: false },
+    pushedDate: Date,
+    status: { type: String, enum: ["pending", "completed", "failed"], default: "pending" },
+    error: String
+  },
+  { _id: false }
+);
+
 const filmSchema = new Schema({
   title: { type: String, required: true, trim: true },
   originalTitle: String,
   year: Number,
   country: String,
   runtime: Number, // minutes
-  category: [{ type: String, index: true }], // from fixed taxonomy (Category.name/slug)
+  category: [{ type: String, index: true }], // from fixed taxonomy (Category.name/slug) — see constants/categories.js + services/categoryMapper.js
   tags: [String], // free-text, secondary to category
   description: String,
   posterUrl: String,
@@ -47,19 +64,20 @@ const filmSchema = new Schema({
   // Size of the master/source video file in bytes. Populated by ingestion
   // (from Archive.org's file metadata) and by uploads (from the browser's
   // File object at upload time). Used to decide sendVideo vs sendDocument
-  // when posting to Telegram (services/telegram.js) — not required
+  // when posting to Telegram (services/telegram.js) and to release
+  // reserved storage capacity on a failed upload — not required
   // elsewhere, so it's fine for this to be missing on older records.
   fileSizeBytes: Number,
-  ladderTier: { type: String, enum: ["minimal", "standard", "high", "premium"] }, // per-title preset; unset = planner picks automatically
-  ladderOverride: [{ // hand-picked exact rungs for this one title, bypasses tier entirely
+  ladderTier: { type: String, enum: ["minimal", "standard", "high", "premium"] }, // reserved for a possible future adaptive-bitrate slice — not currently read or written by any code
+  ladderOverride: [{ // reserved for a possible future adaptive-bitrate slice — not currently read or written by any code
     resolution: String,
     height: Number,
     bitrateKbps: Number
   }],
-  manifestUrl: String, // set only if you've re-transcoded this film into your own ladder — takes priority over streamUrl when present
+  manifestUrl: String, // reserved for a possible future adaptive-bitrate slice — not currently read or written by any code
   transcodeStatus: { type: String, enum: ["not_started", "queued", "processing", "completed", "failed"], default: "not_started" }, // pipeline state for films you DO re-transcode — separate from the moderation `status` below; most archive.org-linked films just stay "not_started" forever
   masterKey: String, // object key on storageProvider, needed for delete() — only relevant when storageProvider is set
-  renditions: [{
+  renditions: [{ // reserved for a possible future adaptive-bitrate slice — not currently read or written by any code
     resolution: String, // "1080p", "720p", "480p", "360p"
     height: Number,
     bitrateKbps: Number,
@@ -75,7 +93,12 @@ const filmSchema = new Schema({
     status: { type: String, enum: ["pending", "completed", "failed"], default: "pending" },
     error: String
   },
-  fileHash: String, // SHA-256, for dedup — indexed below (unique+sparse), not inline
+  // Telegram/WhatsApp fan-out visibility (Slice 11) — previously the only
+  // way to know whether a post succeeded was to search Sentry; now it's
+  // one glance at the film document, same as archiveBackup already was.
+  telegramPost: channelPostSchema,
+  whatsappPost: channelPostSchema,
+  fileHash: String, // SHA-256-derived fingerprint (own-uploads: see lib/fileFingerprint.ts; ingestion: hash of the archive.org identifier), for dedup — indexed below (unique+sparse), not inline
 
   status: { type: String, enum: ["pending", "approved", "rejected"], default: "pending" }, // indexed below as part of the compound browse index
   verifiedBy: String,

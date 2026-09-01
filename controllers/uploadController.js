@@ -6,6 +6,7 @@ const Provider = require("../models/Provider");
 const storage = require("../services/storage");
 const storageRouter = require("../services/storageRouter");
 const { getAdapter } = require("../services/adapterRegistry");
+const { mapToTaxonomy } = require("../services/categoryMapper");
 const { transcribeToVtt } = require("../services/deepgram");
 const { triggerUploadProcessing } = require("../services/githubActions");
 
@@ -15,17 +16,23 @@ function toArray(value) {
   return [];
 }
 
-// GET /api/admin/upload-url?filename=...&contentType=...&fileSizeBytes=...
+// GET /api/admin/upload-url?filename=...&contentType=...&fileSizeBytes=...&fingerprint=...
 //
-// Since Slice 12, this no longer always presigns against R2 — it asks
-// storageRouter which provider (R2/B2/Storj) currently has free capacity,
-// per the priority order configured at /admin/storage, and presigns
-// against whichever one it picks. fileSizeBytes is required now: the
-// router needs it up front to decide whether a candidate provider
-// actually has room, not just to record it after the fact.
+// fingerprint is a lightweight client-computed fingerprint of the file
+// (see frontend's lib/fileFingerprint.ts) — a hash of just the first few
+// MB plus the exact file size, not a full-file hash. The backend never
+// receives the file's bytes at all (uploads go straight from the browser
+// to storage), so it can't compute this itself; the browser has to.
+//
+// Checked here, BEFORE storageRouter reserves any capacity — rejecting a
+// duplicate after already reserving (and having to release) space would
+// be unnecessary churn for an upload that was always going to be
+// rejected. Film.fileHash also has a unique+sparse index as a DB-level
+// backstop against a race between two near-simultaneous uploads of the
+// same file (see createUpload's catch block below).
 async function getUploadUrl(req, res) {
   try {
-    const { filename, contentType, fileSizeBytes } = req.query;
+    const { filename, contentType, fileSizeBytes, fingerprint } = req.query;
     if (!filename) {
       return res.status(400).json({ error: "Missing required query parameter: filename" });
     }
@@ -33,6 +40,17 @@ async function getUploadUrl(req, res) {
       return res
         .status(400)
         .json({ error: "Missing or invalid required query parameter: fileSizeBytes" });
+    }
+    if (!fingerprint) {
+      return res.status(400).json({ error: "Missing required query parameter: fingerprint" });
+    }
+
+    const existing = await Film.findOne({ fileHash: fingerprint }, { title: 1 });
+    if (existing) {
+      return res.status(409).json({
+        error: `This file was already uploaded as "${existing.title}".`,
+        duplicateOf: existing._id,
+      });
     }
 
     const result = await storageRouter.reserveUploadSlot(
@@ -50,11 +68,14 @@ async function getUploadUrl(req, res) {
 }
 
 // POST /api/admin/uploads
-// Body: { key, storageProvider, title, description?, year?, country?, category?, tags?, director?, cast?, fileSizeBytes? }
+// Body: { key, storageProvider, fingerprint, title, description?, year?, country?, category?, tags?, director?, cast?, fileSizeBytes? }
 //
-// storageProvider must be whatever getUploadUrl returned above — the
-// frontend just relays it through unchanged, it never picks a provider
-// itself.
+// storageProvider and fingerprint must be whatever getUploadUrl returned/
+// was called with above — the frontend just relays them through
+// unchanged. category is mapped through the fixed taxonomy here too
+// (not just relying on the frontend's picker), so the invariant
+// "Film.category only ever contains valid taxonomy names" holds
+// regardless of entry path.
 //
 // Two processing tracks run from here:
 //  - Captions (Deepgram): awaited synchronously. Deepgram fetches the
@@ -71,6 +92,7 @@ async function createUpload(req, res) {
     const {
       key,
       storageProvider,
+      fingerprint,
       title,
       description,
       year,
@@ -88,6 +110,9 @@ async function createUpload(req, res) {
     if (!storageProvider) {
       return res.status(400).json({ error: "Missing required field: storageProvider" });
     }
+    if (!fingerprint) {
+      return res.status(400).json({ error: "Missing required field: fingerprint" });
+    }
     if (!title || !title.trim()) {
       return res.status(400).json({ error: "Missing required field: title" });
     }
@@ -95,25 +120,40 @@ async function createUpload(req, res) {
     const adapter = getAdapter(storageProvider);
     const streamUrl = adapter.getPublicUrl(key);
 
-    const film = await Film.create({
-      title: title.trim(),
-      description,
-      year: year ? Number(year) : undefined,
-      country,
-      category: toArray(category),
-      tags: toArray(tags),
-      director,
-      cast: toArray(cast),
-      fileSizeBytes: fileSizeBytes ? Number(fileSizeBytes) : undefined,
-      source: "own-upload",
-      storageProvider,
-      masterKey: key,
-      streamUrl,
-      downloadUrl: streamUrl,
-      transcodeStatus: "queued",
-      status: "pending",
-      verifiedBy: req.user?.email || req.user?.uid,
-    });
+    let film;
+    try {
+      film = await Film.create({
+        title: title.trim(),
+        description,
+        year: year ? Number(year) : undefined,
+        country,
+        category: mapToTaxonomy(toArray(category)),
+        tags: toArray(tags),
+        director,
+        cast: toArray(cast),
+        fileSizeBytes: fileSizeBytes ? Number(fileSizeBytes) : undefined,
+        fileHash: fingerprint,
+        source: "own-upload",
+        storageProvider,
+        masterKey: key,
+        streamUrl,
+        downloadUrl: streamUrl,
+        transcodeStatus: "queued",
+        status: "pending",
+        verifiedBy: req.user?.email || req.user?.uid,
+      });
+    } catch (createErr) {
+      // A near-simultaneous duplicate upload can slip past
+      // getUploadUrl's precheck (both requests see "no match yet" before
+      // either finishes) — the unique+sparse index on fileHash is the
+      // real guarantee, and a duplicate-key error here means exactly
+      // that race happened. Surface it the same way as a normal
+      // precheck rejection, not as a raw 500.
+      if (createErr?.code === 11000) {
+        return res.status(409).json({ error: "This file was already uploaded." });
+      }
+      throw createErr;
+    }
 
     // --- Captions (Deepgram, awaited) ---
     try {
