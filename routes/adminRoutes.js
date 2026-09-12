@@ -4,6 +4,7 @@ const express = require("express");
 const router = express.Router();
 const verifyFirebaseToken = require("../middleware/verifyFirebaseToken");
 const adminController = require("../controllers/adminController");
+const filmManagementController = require("../controllers/filmManagementController");
 const uploadController = require("../controllers/uploadController");
 const providerController = require("../controllers/providerController");
 const logController = require("../controllers/logController");
@@ -11,21 +12,34 @@ const logController = require("../controllers/logController");
 // Every route below requires a valid Firebase ID token
 router.use(verifyFirebaseToken);
 
-// GET /api/admin/films?status=pending
+// GET /api/admin/films?status=pending|approved|rejected|all
+// "all" (Slice 13) backs /admin/films — every film regardless of
+// status, fetched once and filtered client-side (see
+// services/filmService.js's getAllFilms).
 router.get("/films", adminController.listFilmsByStatus);
 
 // GET /api/admin/films/unhealthy — approved films with a failed
 // link-health check (see scripts/checkLinks.js). Mounted before the
-// :id-shaped approve/reject routes below since "unhealthy" isn't a film
-// id, but Express matches routes in declaration order regardless — kept
-// up here for readability, next to the other films listing route.
+// :id-shaped routes below since "unhealthy" isn't a film id, but
+// Express matches routes in declaration order regardless — kept up here
+// for readability, next to the other films listing route.
 router.get("/films/unhealthy", adminController.listUnhealthyFilms);
 
 // POST /api/admin/films/:id/approve
 router.post("/films/:id/approve", adminController.approveFilm);
 
-// POST /api/admin/films/:id/reject
+// POST /api/admin/films/:id/reject — the pending-only /admin/queue's
+// Reject action.
 router.post("/films/:id/reject", adminController.rejectFilm);
+
+// --- Slice 13: film management (remove / restore / delete), used by
+// /admin/films ---
+// "Remove" hits the same underlying logic as "Reject" above (see
+// adminController.rejectOrRemoveFilm) but is kept as its own route since
+// it's a distinct admin-facing concept, called from a different page.
+router.post("/films/:id/remove", filmManagementController.removeFilm);
+router.post("/films/:id/restore", filmManagementController.restoreFilm);
+router.delete("/films/:id", filmManagementController.deleteFilm);
 
 // GET /api/admin/upload-url?filename=...&contentType=...&fileSizeBytes=...&fingerprint=...
 router.get("/upload-url", uploadController.getUploadUrl);

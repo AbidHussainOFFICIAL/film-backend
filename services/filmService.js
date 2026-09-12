@@ -16,6 +16,15 @@ async function getFilmsByStatus(status) {
   return Film.find({ status }).sort({ addedDate: -1 });
 }
 
+// Every film regardless of status (Slice 13) — backs /admin/films, the
+// "manage everything" view. Unlike getFilmsByStatus, this applies no
+// status filter at all; the frontend fetches once and filters
+// client-side by title/status tab, the same pattern /browse's FilmGrid
+// already uses at this catalog size.
+async function getAllFilms() {
+  return Film.find({}).sort({ addedDate: -1 });
+}
+
 // Approved films whose last link-health check came back unhealthy — see
 // scripts/checkLinks.js (runs weekly via film-media-worker). Only ever
 // meaningful for approved films: pending/rejected films are never
@@ -54,6 +63,7 @@ module.exports = {
   getApprovedFilms,
   getFilmById,
   getFilmsByStatus,
+  getAllFilms,
   getUnhealthyFilms,
   setFilmStatus,
   getFilmsByIds,
