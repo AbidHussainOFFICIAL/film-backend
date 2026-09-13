@@ -76,6 +76,33 @@ const filmSchema = new Schema({
   }],
   manifestUrl: String, // reserved for a possible future adaptive-bitrate slice — not currently read or written by any code
   transcodeStatus: { type: String, enum: ["not_started", "queued", "processing", "completed", "failed"], default: "not_started" }, // pipeline state for films you DO re-transcode — separate from the moderation `status` below; most archive.org-linked films just stay "not_started" forever
+  // --- Slice 14: stuck-transcode reconciliation ---
+  // transcodeStartedAt is set at DISPATCH time (own-upload creation via
+  // uploadController.createUpload, a manual admin retry via
+  // uploadController.retryProcessing, or an automated retry from the
+  // stuck-transcode sweep) — not from process-upload.yml's "running"
+  // callback. This is what lets serviceController.reconcileStuckTranscodes
+  // measure real total wait time since processing was last (re)dispatched,
+  // matching how that workflow's own timeout-minutes: 120 ceiling is
+  // measured, and re-armed every time processing restarts so a fresh
+  // dispatch gets a fresh window rather than inheriting a stale timer.
+  transcodeStartedAt: Date,
+  // How many times the stuck-transcode reconciliation sweep has
+  // automatically retried this film — capped at one automatic retry
+  // before the sweep gives up and marks it failed (see
+  // serviceController.reconcileStuckTranscodes). Reset to 0 by a manual
+  // admin retry (uploadController.retryProcessing), since that's a
+  // deliberate fresh attempt, not a continuation of the automated one.
+  transcodeRetryCount: { type: Number, default: 0 },
+  // Human-readable reason the last transcode attempt failed. Populated
+  // from three places: the worker's own reported failure
+  // (serviceController.handleUploadCallback), a dispatch failure at
+  // creation time (uploadController.createUpload), or the stuck-transcode
+  // sweep giving up after its one retry (serviceController.
+  // reconcileStuckTranscodes). Cleared on a manual admin retry. Shown
+  // alongside the existing "Processing failed" badge on /admin/queue and
+  // /admin/films (Slice 13) — no new page needed to surface it.
+  transcodeError: String,
   masterKey: String, // object key on storageProvider, needed for delete() — only relevant when storageProvider is set
   renditions: [{ // reserved for a possible future adaptive-bitrate slice — not currently read or written by any code
     resolution: String, // "1080p", "720p", "480p", "360p"
@@ -134,5 +161,9 @@ filmSchema.index({ status: 1, category: 1, addedDate: -1 });
 filmSchema.index({ title: "text", originalTitle: "text", tags: "text", description: "text" });
 // link-health sweep job
 filmSchema.index({ "linkHealth.isHealthy": 1, "linkHealth.lastChecked": 1 });
+// stuck-transcode reconciliation sweep (Slice 14): "own-uploads still
+// processing, dispatched before some cutoff" — mirrors the shape of the
+// link-health index above for the same reason (a periodic sweep query).
+filmSchema.index({ transcodeStatus: 1, transcodeStartedAt: 1 });
 
 module.exports = model("Film", filmSchema);

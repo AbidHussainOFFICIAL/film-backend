@@ -24,6 +24,12 @@ router.post("/jobs/:id/complete", serviceController.completeJob);
 
 router.post("/uploads/:id/callback", serviceController.handleUploadCallback);
 
+// POST /api/service/transcodes/reconcile-stuck (Slice 14) — called every
+// 30 minutes by film-media-worker's reconcile-transcodes.yml cron. Finds
+// own-uploads stuck in transcodeStatus: "processing" past a timeout,
+// retries once, then gives up and marks them failed.
+router.post("/transcodes/reconcile-stuck", serviceController.reconcileStuckTranscodes);
+
 // GET /api/service/apk/upload-url — called by film-frontend's
 // build-apk.yml to get a presigned R2 upload URL for the built APK.
 router.get("/apk/upload-url", serviceController.getApkUploadUrl);

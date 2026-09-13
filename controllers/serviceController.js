@@ -3,7 +3,6 @@
 const Sentry = require("@sentry/node");
 const Film = require("../models/Film");
 const JobRun = require("../models/JobRun");
-const Provider = require("../models/Provider");
 const filmService = require("../services/filmService");
 const ingestionService = require("../services/ingestionService");
 const storage = require("../services/storage");
@@ -12,6 +11,8 @@ const { postFilmToTelegram } = require("../services/telegram");
 const { postFilmToChannel } = require("../services/whatsapp");
 const { backupFilmToArchiveOrg } = require("../services/archiveBackup");
 const { incrementCategoryCounts } = require("../services/categoryService");
+const { triggerUploadProcessing } = require("../services/githubActions");
+const { releaseReservedCapacity } = require("../services/storageCapacityService");
 const { withTimeout } = require("../utils/withTimeout");
 
 // Fixed R2 key for the Android APK release asset — always overwritten in
@@ -26,6 +27,15 @@ const APK_CONTENT_TYPE = "application/vnd.android.package-archive";
 // THROW, not a HANG (WhatsApp's postFilmToChannel in particular can
 // hang indefinitely if its persistent session isn't currently live).
 const SIDE_EFFECT_TIMEOUT_MS = 6 * 60 * 1000; // 6 minutes
+
+// Slice 14 — how long a film can sit in transcodeStatus: "processing"
+// (measured from transcodeStartedAt, set at dispatch time) before the
+// reconciliation sweep below treats it as stuck. process-upload.yml's
+// own job has a hard timeout-minutes: 120 ceiling, so anything still
+// "processing" well past that either hung, got killed, or its callback
+// never arrived — 150 minutes gives a 30-minute buffer for callback
+// delivery/network delay on top of that.
+const STUCK_TRANSCODE_THRESHOLD_MS = 150 * 60 * 1000; // 150 minutes
 
 // ---------------------------------------------------------------------
 // Films — used by the ingest.yml and qdrant-reindex.yml workflows
@@ -238,6 +248,7 @@ async function handleUploadCallback(req, res) {
       if (durationSeconds) film.runtime = Math.round(Number(durationSeconds) / 60);
 
       film.transcodeStatus = "completed";
+      film.transcodeError = undefined;
       // Own uploads skip the moderation queue — the admin already vetted
       // this by choosing to upload it in the first place.
       film.status = "approved";
@@ -274,6 +285,7 @@ async function handleUploadCallback(req, res) {
     const alreadyMarkedFailed = film.transcodeStatus === "failed";
 
     film.transcodeStatus = "failed";
+    film.transcodeError = error || "Media processing reported failure with no error message";
     console.error(`Media processing reported failure for film ${id}:`, error || "(no error message provided)");
     // Centralized capture point for process-upload.yml's failures — that
     // workflow is pure bash/ffmpeg, it has no way to call Sentry itself,
@@ -286,17 +298,8 @@ async function handleUploadCallback(req, res) {
     // optimistically, before processing even starts, so a failed run
     // must give that space back rather than permanently consuming quota
     // for a file that was never actually stored successfully.
-    if (!alreadyMarkedFailed && film.storageProvider && typeof film.fileSizeBytes === "number") {
-      await Provider.updateOne(
-        { name: film.storageProvider },
-        { $inc: { usedBytes: -film.fileSizeBytes } }
-      ).catch((releaseErr) => {
-        console.error(
-          `Failed to release reserved capacity for provider ${film.storageProvider} (film ${id}):`,
-          releaseErr.message
-        );
-        Sentry.captureException(releaseErr);
-      });
+    if (!alreadyMarkedFailed) {
+      await releaseReservedCapacity(film);
     }
 
     return res.json({ ok: true });
@@ -369,6 +372,86 @@ async function runPostApprovalSideEffects(film) {
 }
 
 // ---------------------------------------------------------------------
+// Slice 14 — stuck own-upload transcode reconciliation
+// ---------------------------------------------------------------------
+
+// POST /api/service/transcodes/reconcile-stuck
+//
+// Called on a schedule by film-media-worker's reconcile-transcodes.yml
+// (every 30 minutes) — not admin-triggerable and not a JobRun, this is a
+// pure background maintenance sweep, same trust boundary as every other
+// /api/service/* route (verifyServiceSecret, not Firebase).
+//
+// Finds own-uploads whose thumbnail/preview processing
+// (process-upload.yml) was dispatched long enough ago that it should
+// have called back via handleUploadCallback above by now, but never
+// did — a hung run, a killed runner, or a lost callback. Retries once
+// via the same triggerUploadProcessing() dispatch used everywhere else
+// in this app; gives up and marks the film "failed" (releasing its
+// reserved storage capacity) if it's still stuck on a second pass. A
+// given film is never auto-retried more than once — see
+// transcodeRetryCount on models/Film.js.
+async function reconcileStuckTranscodes(req, res) {
+  try {
+    const cutoff = new Date(Date.now() - STUCK_TRANSCODE_THRESHOLD_MS);
+    const stuckFilms = await Film.find({
+      transcodeStatus: "processing",
+      transcodeStartedAt: { $lte: cutoff },
+    });
+
+    let retried = 0;
+    let failed = 0;
+
+    for (const film of stuckFilms) {
+      const canRetry = film.transcodeRetryCount === 0 && film.masterKey && film.storageProvider;
+
+      if (canRetry) {
+        try {
+          await triggerUploadProcessing(film._id, film.masterKey, film.storageProvider);
+          film.transcodeStartedAt = new Date();
+          film.transcodeRetryCount += 1;
+          await film.save();
+          retried += 1;
+          continue;
+        } catch (dispatchErr) {
+          console.error(
+            `Stuck-transcode retry dispatch failed for film ${film._id}:`,
+            dispatchErr.message
+          );
+          Sentry.captureException(dispatchErr);
+          // Falls through to give up below — a dispatch that fails
+          // outright is no better than one that silently hangs, and
+          // there's no reason to wait another sweep cycle to find out.
+        }
+      }
+
+      // Either already retried once and still stuck, has no
+      // masterKey/storageProvider to retry with at all (shouldn't
+      // normally happen for a film in "processing", but guarded rather
+      // than assumed), or the retry dispatch itself just failed above —
+      // give up.
+      film.transcodeStatus = "failed";
+      film.transcodeError =
+        "Processing did not complete within the expected time, including one automatic retry.";
+      await film.save();
+      await releaseReservedCapacity(film);
+
+      Sentry.captureMessage(
+        `Stuck transcode gave up for film ${film._id} (retryCount: ${film.transcodeRetryCount})`,
+        "error"
+      );
+      failed += 1;
+    }
+
+    res.json({ checked: stuckFilms.length, retried, failed });
+  } catch (err) {
+    console.error("Error reconciling stuck transcodes:", err);
+    Sentry.captureException(err);
+    res.status(500).json({ error: "Failed to reconcile stuck transcodes" });
+  }
+}
+
+// ---------------------------------------------------------------------
 // APK — used by film-frontend's build-apk.yml workflow
 // ---------------------------------------------------------------------
 
@@ -393,5 +476,6 @@ module.exports = {
   startJob,
   completeJob,
   handleUploadCallback,
+  reconcileStuckTranscodes,
   getApkUploadUrl,
 };

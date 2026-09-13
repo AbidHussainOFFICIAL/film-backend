@@ -2,13 +2,13 @@
 
 const Sentry = require("@sentry/node");
 const Film = require("../models/Film");
-const Provider = require("../models/Provider");
 const storage = require("../services/storage");
 const storageRouter = require("../services/storageRouter");
 const { getAdapter } = require("../services/adapterRegistry");
 const { mapToTaxonomy } = require("../services/categoryMapper");
 const { transcribeToVtt } = require("../services/deepgram");
 const { triggerUploadProcessing } = require("../services/githubActions");
+const { releaseReservedCapacity } = require("../services/storageCapacityService");
 
 function toArray(value) {
   if (Array.isArray(value)) return value;
@@ -87,6 +87,9 @@ async function getUploadUrl(req, res) {
 //    repo): dispatched and NOT awaited — it reports back later via
 //    POST /api/service/uploads/:id/callback. transcodeStatus reflects
 //    this: it's "processing" when this request returns, not "completed".
+//    transcodeStartedAt is set at this dispatch moment (Slice 14) — see
+//    serviceController.reconcileStuckTranscodes for how that's used to
+//    detect a run that never calls back.
 async function createUpload(req, res) {
   try {
     const {
@@ -172,11 +175,13 @@ async function createUpload(req, res) {
     try {
       await triggerUploadProcessing(film._id, key, storageProvider);
       film.transcodeStatus = "processing";
+      film.transcodeStartedAt = new Date();
       await film.save();
     } catch (dispatchErr) {
       console.error(`Failed to dispatch media processing for ${film._id}:`, dispatchErr.message);
       Sentry.captureException(dispatchErr);
       film.transcodeStatus = "failed";
+      film.transcodeError = dispatchErr.message;
       await film.save();
 
       // The dispatch itself failed, so process-upload.yml never ran —
@@ -185,18 +190,7 @@ async function createUpload(req, res) {
       // instead, so a dispatch failure (bad GITHUB_PAT, GitHub API
       // hiccup, etc.) doesn't permanently consume quota for a file that
       // was never actually processed.
-      if (typeof film.fileSizeBytes === "number") {
-        await Provider.updateOne(
-          { name: storageProvider },
-          { $inc: { usedBytes: -film.fileSizeBytes } }
-        ).catch((releaseErr) => {
-          console.error(
-            `Failed to release reserved capacity for provider ${storageProvider} (film ${film._id}):`,
-            releaseErr.message
-          );
-          Sentry.captureException(releaseErr);
-        });
-      }
+      await releaseReservedCapacity(film);
     }
 
     res.status(201).json(film);
@@ -211,6 +205,13 @@ async function createUpload(req, res) {
 // Re-dispatches thumbnail/preview processing without re-uploading — the
 // master file is already sitting with its recorded storageProvider. Used
 // by the "Retry" button next to failed own-uploads in the admin queue.
+//
+// A manual admin retry is a deliberate fresh attempt, distinct from the
+// automated stuck-transcode sweep's own one-shot retry (Slice 14) — so
+// this resets transcodeRetryCount to 0 (giving that sweep a full fresh
+// attempt of its own if this retry also gets stuck) and clears any
+// previous transcodeError, rather than treating this as a continuation
+// of whatever attempt came before.
 async function retryProcessing(req, res) {
   try {
     const film = await Film.findById(req.params.id);
@@ -226,6 +227,9 @@ async function retryProcessing(req, res) {
 
     await triggerUploadProcessing(film._id, film.masterKey, film.storageProvider);
     film.transcodeStatus = "processing";
+    film.transcodeStartedAt = new Date();
+    film.transcodeRetryCount = 0;
+    film.transcodeError = undefined;
     await film.save();
 
     res.json(film);
