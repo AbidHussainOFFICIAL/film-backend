@@ -2,16 +2,24 @@
 
 const admin = require("firebase-admin");
 
-// Initialized once, from a Firebase service account's credentials — NOT the
-// same as the frontend's Firebase config. Get these from:
-// Firebase Console → Project settings → Service accounts → Generate new private key
 if (!admin.apps.length) {
   const projectId = process.env.FIREBASE_PROJECT_ID;
   const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
-  // .env files can't hold real newlines in a single value, so the private
-  // key is stored with literal "\n" sequences and unescaped here.
-  const privateKey = process.env.FIREBASE_PRIVATE_KEY
-    ? process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n")
+
+  // Stitch split keys if present, otherwise fall back to single FIREBASE_PRIVATE_KEY
+  const rawKey =
+    (process.env.FIREBASE_PRIVATE_KEY_1 || "") +
+    (process.env.FIREBASE_PRIVATE_KEY_2 || "") +
+    (process.env.FIREBASE_PRIVATE_KEY_3 || "") ||
+    process.env.FIREBASE_PRIVATE_KEY ||
+    "";
+
+  // Clean outer quotes and unescape newline characters
+  const privateKey = rawKey
+    ? rawKey
+        .trim()
+        .replace(/^"|"$/g, "")
+        .replace(/\\n/g, "\n")
     : undefined;
 
   if (!projectId || !clientEmail || !privateKey) {
