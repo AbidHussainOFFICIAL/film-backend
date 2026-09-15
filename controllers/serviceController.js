@@ -3,6 +3,7 @@
 const Sentry = require("@sentry/node");
 const Film = require("../models/Film");
 const JobRun = require("../models/JobRun");
+const Provider = require("../models/Provider");
 const filmService = require("../services/filmService");
 const ingestionService = require("../services/ingestionService");
 const storage = require("../services/storage");
@@ -11,7 +12,7 @@ const { postFilmToTelegram } = require("../services/telegram");
 const { postFilmToChannel } = require("../services/whatsapp");
 const { backupFilmToArchiveOrg } = require("../services/archiveBackup");
 const { incrementCategoryCounts } = require("../services/categoryService");
-const { triggerUploadProcessing } = require("../services/githubActions");
+const { triggerUploadProcessing, triggerAbrTranscode } = require("../services/githubActions");
 const { releaseReservedCapacity } = require("../services/storageCapacityService");
 const { withTimeout } = require("../utils/withTimeout");
 
@@ -36,6 +37,19 @@ const SIDE_EFFECT_TIMEOUT_MS = 6 * 60 * 1000; // 6 minutes
 // never arrived — 150 minutes gives a 30-minute buffer for callback
 // delivery/network delay on top of that.
 const STUCK_TRANSCODE_THRESHOLD_MS = 150 * 60 * 1000; // 150 minutes
+
+// Slice 15 — same idea, for the much longer-running ABR job.
+// abr-transcode.yml's own job has timeout-minutes: 300, so this uses the
+// same "job's own ceiling + ~30 minute callback buffer" logic as above,
+// just against the longer ceiling.
+const STUCK_ABR_THRESHOLD_MS = 330 * 60 * 1000; // 330 minutes
+
+// Slice 15 — the floor below which multi-quality streaming isn't
+// attempted at all (nothing to ladder below this). Duplicated (in
+// comment and value, not logic) in controllers/uploadController.js for
+// the "Generate multi-quality" retry action's own validation — the two
+// must be kept in sync if this ever changes.
+const ABR_MIN_SOURCE_HEIGHT = 480;
 
 // ---------------------------------------------------------------------
 // Films — used by the ingest.yml and qdrant-reindex.yml workflows
@@ -203,6 +217,41 @@ async function completeJob(req, res) {
 // Uploads — the process-upload.yml workflow's completion callback
 // ---------------------------------------------------------------------
 
+// Slice 15 — decides whether to dispatch the ABR job and mutates `film`
+// in place accordingly (abrStatus/abrError/abrStartedAt). Called from
+// handleUploadCallback's "completed" branch below, the moment
+// sourceHeight becomes known — this is deliberately synchronous (not
+// decoupled/fire-and-forget like runPostApprovalSideEffects further
+// down): it's a single fast GitHub API dispatch call, the same kind of
+// call triggerUploadProcessing already makes elsewhere in this codebase,
+// not a potentially slow/hanging integration like Telegram/WhatsApp.
+// Does not save() — the caller saves once, after this and every other
+// field on `film` for this callback have been set.
+async function decideAndDispatchAbr(film) {
+  if (!film.abrRequested) {
+    film.abrStatus = "not_applicable";
+    return;
+  }
+
+  if (!film.sourceHeight || film.sourceHeight < ABR_MIN_SOURCE_HEIGHT) {
+    film.abrStatus = "skipped";
+    film.abrError = `Source resolution (${film.sourceHeight || "unknown"}p) is below the ${ABR_MIN_SOURCE_HEIGHT}p threshold for multi-quality streaming.`;
+    return;
+  }
+
+  try {
+    await triggerAbrTranscode(film._id, film.masterKey, film.storageProvider);
+    film.abrStatus = "processing";
+    film.abrStartedAt = new Date();
+    film.abrError = undefined;
+  } catch (dispatchErr) {
+    console.error(`Failed to dispatch ABR transcode for film ${film._id}:`, dispatchErr.message);
+    Sentry.captureException(dispatchErr);
+    film.abrStatus = "failed";
+    film.abrError = dispatchErr.message;
+  }
+}
+
 // POST /api/service/uploads/:id/callback
 // Body on start:    { status: "running" }
 // Body on success:  { status: "completed", thumbKey, previewKey, sourceHeight?, durationSeconds? }
@@ -253,6 +302,11 @@ async function handleUploadCallback(req, res) {
       // this by choosing to upload it in the first place.
       film.status = "approved";
       film.verifiedDate = new Date();
+
+      // Slice 15: now that sourceHeight is known, decide whether to
+      // dispatch the separate ABR job. See decideAndDispatchAbr above.
+      await decideAndDispatchAbr(film);
+
       await film.save();
 
       // Respond to the caller (process-upload.yml's "Report success to
@@ -372,82 +426,195 @@ async function runPostApprovalSideEffects(film) {
 }
 
 // ---------------------------------------------------------------------
-// Slice 14 — stuck own-upload transcode reconciliation
+// Slice 15 — ABR (adaptive bitrate) transcode callback
 // ---------------------------------------------------------------------
+
+// POST /api/service/uploads/:id/abr-callback
+// Body on success: { status: "completed", manifestKey, renditions: [{resolution,height,bitrateKbps,key,segmentCount}], audioTracks: [{index,language,label,isDefault}], totalOutputBytes }
+// Body on failure: { status: "failed", error }
+//
+// Entirely separate from handleUploadCallback above — this is the much
+// longer-running, fully independent ABR job's own completion callback.
+// A failure here NEVER touches the film's transcodeStatus, status
+// (approved/pending/rejected), or its original direct-file playback —
+// the film was already published by the fast thumbnail/preview job long
+// before this callback ever arrives.
+async function handleAbrCallback(req, res) {
+  try {
+    const { id } = req.params;
+    const { status, manifestKey, renditions, audioTracks, totalOutputBytes, error } = req.body;
+
+    const film = await Film.findById(id);
+    if (!film) {
+      return res.status(404).json({ error: "Film not found" });
+    }
+
+    if (status === "completed") {
+      if (!manifestKey || !Array.isArray(renditions) || renditions.length === 0) {
+        return res.status(400).json({ error: "Missing manifestKey/renditions for a completed ABR callback" });
+      }
+      if (!film.storageProvider) {
+        return res
+          .status(400)
+          .json({ error: "Film has no storageProvider recorded — cannot resolve public URLs" });
+      }
+
+      const adapter = getAdapter(film.storageProvider);
+
+      film.manifestUrl = adapter.getPublicUrl(manifestKey);
+      film.renditions = renditions.map((r) => ({
+        resolution: r.resolution,
+        height: r.height,
+        bitrateKbps: r.bitrateKbps,
+        key: r.key,
+        playlistUrl: adapter.getPublicUrl(r.key),
+        segmentCount: r.segmentCount,
+        codec: "h264",
+      }));
+      film.audioTracks = Array.isArray(audioTracks) ? audioTracks : [];
+      film.abrStatus = "completed";
+      film.abrError = undefined;
+
+      if (typeof totalOutputBytes === "number") {
+        film.abrOutputBytes = totalOutputBytes;
+        // Counted against the provider now, for real, using the actual
+        // reported size — unlike the master file's capacity (reserved
+        // upfront, before the bytes exist, since that upload is
+        // presigned and race-prone), there's no race to guard against
+        // here: this is a backend-dispatched job whose outcome is only
+        // known after the fact, so it's simply added once it's known.
+        await Provider.updateOne(
+          { name: film.storageProvider },
+          { $inc: { usedBytes: totalOutputBytes } }
+        ).catch((provErr) => {
+          console.error(`Failed to account for ABR output size for film ${id}:`, provErr.message);
+          Sentry.captureException(provErr);
+        });
+      }
+
+      await film.save();
+      return res.json({ ok: true });
+    }
+
+    // status === "failed"
+    film.abrStatus = "failed";
+    film.abrError = error || "ABR transcode reported failure with no error message";
+    console.error(`ABR transcode failed for film ${id}:`, error || "(no error message provided)");
+    Sentry.captureMessage(`ABR transcode failed for film ${id}: ${error || "no error message"}`, "error");
+    await film.save();
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("Error handling ABR callback:", err);
+    Sentry.captureException(err);
+    res.status(500).json({ error: "Failed to process ABR callback" });
+  }
+}
+
+// ---------------------------------------------------------------------
+// Slice 14/15 — stuck-job reconciliation (thumbnail/preview + ABR)
+// ---------------------------------------------------------------------
+
+// Thumbnail/preview jobs (Slice 14) — retries once via the same
+// triggerUploadProcessing() dispatch used everywhere else in this app,
+// then gives up and marks the film "failed" (releasing its reserved
+// storage capacity) if it's still stuck on a second pass.
+async function reconcileStuckTranscodeJobs() {
+  const cutoff = new Date(Date.now() - STUCK_TRANSCODE_THRESHOLD_MS);
+  const stuckFilms = await Film.find({
+    transcodeStatus: "processing",
+    transcodeStartedAt: { $lte: cutoff },
+  });
+
+  let retried = 0;
+  let failed = 0;
+
+  for (const film of stuckFilms) {
+    const canRetry = film.transcodeRetryCount === 0 && film.masterKey && film.storageProvider;
+
+    if (canRetry) {
+      try {
+        await triggerUploadProcessing(film._id, film.masterKey, film.storageProvider);
+        film.transcodeStartedAt = new Date();
+        film.transcodeRetryCount += 1;
+        await film.save();
+        retried += 1;
+        continue;
+      } catch (dispatchErr) {
+        console.error(
+          `Stuck-transcode retry dispatch failed for film ${film._id}:`,
+          dispatchErr.message
+        );
+        Sentry.captureException(dispatchErr);
+        // Falls through to give up below — a dispatch that fails
+        // outright is no better than one that silently hangs.
+      }
+    }
+
+    film.transcodeStatus = "failed";
+    film.transcodeError =
+      "Processing did not complete within the expected time, including one automatic retry.";
+    await film.save();
+    await releaseReservedCapacity(film);
+
+    Sentry.captureMessage(
+      `Stuck transcode gave up for film ${film._id} (retryCount: ${film.transcodeRetryCount})`,
+      "error"
+    );
+    failed += 1;
+  }
+
+  return { checked: stuckFilms.length, retried, failed };
+}
+
+// ABR jobs (Slice 15) — deliberately NEVER auto-retried, unlike
+// thumbnail/preview above. ABR jobs are far longer-running (up to 300
+// minutes) and meaningfully more expensive per attempt than the fast
+// thumbnail/preview job, so silently auto-retrying a job this costly on
+// a timer is a real CI-minutes decision better left to the admin's
+// explicit "Generate multi-quality" action (uploadController.generateAbr)
+// than to an automatic sweep. A stuck ABR job goes straight to "failed"
+// — the film's direct-file playback is completely unaffected either way,
+// and no capacity needs releasing since ABR output bytes are only ever
+// added on a SUCCESS callback, never reserved upfront.
+async function reconcileStuckAbrJobs() {
+  const cutoff = new Date(Date.now() - STUCK_ABR_THRESHOLD_MS);
+  const stuckFilms = await Film.find({
+    abrStatus: "processing",
+    abrStartedAt: { $lte: cutoff },
+  });
+
+  let failed = 0;
+
+  for (const film of stuckFilms) {
+    film.abrStatus = "failed";
+    film.abrError = "ABR transcode did not complete within the expected time.";
+    await film.save();
+
+    Sentry.captureMessage(`Stuck ABR job gave up for film ${film._id}`, "error");
+    failed += 1;
+  }
+
+  return { checked: stuckFilms.length, retried: 0, failed };
+}
 
 // POST /api/service/transcodes/reconcile-stuck
 //
 // Called on a schedule by film-media-worker's reconcile-transcodes.yml
 // (every 30 minutes) — not admin-triggerable and not a JobRun, this is a
 // pure background maintenance sweep, same trust boundary as every other
-// /api/service/* route (verifyServiceSecret, not Firebase).
-//
-// Finds own-uploads whose thumbnail/preview processing
-// (process-upload.yml) was dispatched long enough ago that it should
-// have called back via handleUploadCallback above by now, but never
-// did — a hung run, a killed runner, or a lost callback. Retries once
-// via the same triggerUploadProcessing() dispatch used everywhere else
-// in this app; gives up and marks the film "failed" (releasing its
-// reserved storage capacity) if it's still stuck on a second pass. A
-// given film is never auto-retried more than once — see
-// transcodeRetryCount on models/Film.js.
-async function reconcileStuckTranscodes(req, res) {
+// /api/service/* route (verifyServiceSecret, not Firebase). Covers both
+// independent job types (thumbnail/preview, and Slice 15's ABR job) in
+// one pass rather than two separate near-identical sweeps/endpoints.
+async function reconcileStuckJobs(req, res) {
   try {
-    const cutoff = new Date(Date.now() - STUCK_TRANSCODE_THRESHOLD_MS);
-    const stuckFilms = await Film.find({
-      transcodeStatus: "processing",
-      transcodeStartedAt: { $lte: cutoff },
-    });
-
-    let retried = 0;
-    let failed = 0;
-
-    for (const film of stuckFilms) {
-      const canRetry = film.transcodeRetryCount === 0 && film.masterKey && film.storageProvider;
-
-      if (canRetry) {
-        try {
-          await triggerUploadProcessing(film._id, film.masterKey, film.storageProvider);
-          film.transcodeStartedAt = new Date();
-          film.transcodeRetryCount += 1;
-          await film.save();
-          retried += 1;
-          continue;
-        } catch (dispatchErr) {
-          console.error(
-            `Stuck-transcode retry dispatch failed for film ${film._id}:`,
-            dispatchErr.message
-          );
-          Sentry.captureException(dispatchErr);
-          // Falls through to give up below — a dispatch that fails
-          // outright is no better than one that silently hangs, and
-          // there's no reason to wait another sweep cycle to find out.
-        }
-      }
-
-      // Either already retried once and still stuck, has no
-      // masterKey/storageProvider to retry with at all (shouldn't
-      // normally happen for a film in "processing", but guarded rather
-      // than assumed), or the retry dispatch itself just failed above —
-      // give up.
-      film.transcodeStatus = "failed";
-      film.transcodeError =
-        "Processing did not complete within the expected time, including one automatic retry.";
-      await film.save();
-      await releaseReservedCapacity(film);
-
-      Sentry.captureMessage(
-        `Stuck transcode gave up for film ${film._id} (retryCount: ${film.transcodeRetryCount})`,
-        "error"
-      );
-      failed += 1;
-    }
-
-    res.json({ checked: stuckFilms.length, retried, failed });
+    const transcode = await reconcileStuckTranscodeJobs();
+    const abr = await reconcileStuckAbrJobs();
+    res.json({ transcode, abr });
   } catch (err) {
-    console.error("Error reconciling stuck transcodes:", err);
+    console.error("Error reconciling stuck jobs:", err);
     Sentry.captureException(err);
-    res.status(500).json({ error: "Failed to reconcile stuck transcodes" });
+    res.status(500).json({ error: "Failed to reconcile stuck jobs" });
   }
 }
 
@@ -476,6 +643,7 @@ module.exports = {
   startJob,
   completeJob,
   handleUploadCallback,
-  reconcileStuckTranscodes,
+  handleAbrCallback,
+  reconcileStuckJobs,
   getApkUploadUrl,
 };

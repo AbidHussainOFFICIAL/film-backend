@@ -2,27 +2,28 @@
  * backend/services/storageCapacityService.js
  *
  * A single shared place to release storage capacity that was reserved
- * for an own-upload but never actually consumed (because processing
- * failed before or after it started). Before Slice 14 this exact
- * Provider.updateOne({ $inc: { usedBytes: -fileSizeBytes } }) block was
- * copy-pasted in three places that all needed the same guard — a film
- * whose capacity was already released must never have it released a
- * second time, or a provider's usedBytes drifts permanently negative.
- * Factored out here rather than adding a fourth copy for the new
- * stuck-transcode reconciliation sweep (services/serviceController.js's
- * reconcileStuckTranscodes).
+ * or counted for an own-upload but shouldn't keep being charged against
+ * a provider's free limit. Two independent cases, two functions:
  *
- * Best-effort, matching this project's pattern everywhere else — a
- * transient DB hiccup releasing capacity shouldn't block whatever
- * caller-side failure handling is already in progress (marking a film
- * failed, giving up on a stuck transcode, etc.).
+ * releaseReservedCapacity — for the ORIGINAL master file's size
+ * (fileSizeBytes), reserved optimistically at upload time before the
+ * bytes even exist (storageRouter.reserveUploadSlot). Before Slice 14
+ * this exact release logic was copy-pasted in multiple places that all
+ * needed the same guard — a film whose capacity was already released
+ * must never have it released a second time, or a provider's usedBytes
+ * drifts permanently negative.
  *
- * Callers are responsible for their own "was this already released"
- * guard before calling this — see controllers/serviceController.js's
- * handleUploadCallback (guards on transcodeStatus !== "failed" already
- * being true) and reconcileStuckTranscodes (safe by construction: a film
- * only ever matches the stuck-transcode query once, since giving up
- * flips its status away from "processing").
+ * releaseAbrCapacity (Slice 15) — for the SEPARATE, much larger amount
+ * added on top once an ABR job succeeds (abrOutputBytes) — the full HLS
+ * ladder's total output size, which is never known upfront and is only
+ * ever added once, by the ABR success callback, so unlike
+ * releaseReservedCapacity it needs no "already released" guard: it's
+ * simply a no-op if abrOutputBytes was never set in the first place.
+ *
+ * Both are best-effort, matching this project's pattern everywhere
+ * else — a transient DB hiccup releasing capacity shouldn't block
+ * whatever caller-side failure/deletion handling is already in
+ * progress.
  */
 
 const Sentry = require("@sentry/node");
@@ -45,4 +46,21 @@ async function releaseReservedCapacity(film) {
   }
 }
 
-module.exports = { releaseReservedCapacity };
+async function releaseAbrCapacity(film) {
+  if (!film.storageProvider || typeof film.abrOutputBytes !== "number") return;
+
+  try {
+    await Provider.updateOne(
+      { name: film.storageProvider },
+      { $inc: { usedBytes: -film.abrOutputBytes } }
+    );
+  } catch (err) {
+    console.error(
+      `Failed to release ABR output capacity for provider ${film.storageProvider} (film ${film._id}):`,
+      err.message
+    );
+    Sentry.captureException(err);
+  }
+}
+
+module.exports = { releaseReservedCapacity, releaseAbrCapacity };

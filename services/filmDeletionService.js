@@ -13,19 +13,7 @@
  * Each step's outcome is returned in `steps` so the caller can surface a
  * partial-failure warning instead of a blanket "deleted successfully"
  * when something (e.g. an orphaned storage object) may need manual
- * follow-up. Nothing else in this codebase currently reports
- * partial-failure detail back to a caller, but a silent gap here is
- * uniquely costly: an orphaned storage object keeps costing real quota
- * with no other record it was ever supposed to be cleaned up.
- *
- * Two of the steps below (Qdrant, category count) call functions that
- * are THEMSELVES already best-effort and non-throwing by design
- * (deleteFilmEmbedding in qdrantService.js, decrementCategoryCounts in
- * categoryService.js — both used the same way elsewhere, e.g.
- * adminController.rejectOrRemoveFilm) — so those two steps always report
- * "ok" once attempted; a genuine underlying failure is still visible via
- * their own console logging/Sentry capture, just not reflected in
- * `steps` here, since neither surfaces failure to its caller by design.
+ * follow-up.
  *
  * Deliberately does NOT touch the film's Archive.org backup copy, if it
  * has one (archiveBackup.pushed) — IAS3 has no delete API; removal there
@@ -45,6 +33,15 @@
  * reliable — the convention is fixed and used consistently in exactly
  * those two places — but inferred, not stored: if that convention ever
  * changes, older films' delete could silently miss an orphaned object.
+ *
+ * Slice 15 addition: an ABR-generated HLS ladder lives under
+ * uploads/{filmId}/hls/ (see film-media-worker's abr-transcode.yml) — a
+ * whole folder of files, not a single key, and unlike the thumb/preview
+ * keys above it doesn't need to be INFERRED from masterKey at all: it's
+ * keyed directly by the film's own _id, which is always known and never
+ * ambiguous. Cleaned up via the new StorageAdapter.deletePrefix(), and
+ * its counted storage capacity (abrOutputBytes) released separately from
+ * the master file's own capacity release below.
  */
 
 const Sentry = require("@sentry/node");
@@ -54,6 +51,7 @@ const { getAdapter } = require("./adapterRegistry");
 const R2Adapter = require("../adapters/R2Adapter");
 const { deleteFilmEmbedding } = require("./qdrantService");
 const { decrementCategoryCounts } = require("./categoryService");
+const { releaseAbrCapacity } = require("./storageCapacityService");
 
 function baseKeyOf(masterKey) {
   return masterKey.replace(/\.[^/.]+$/, "");
@@ -71,6 +69,13 @@ function captionsKeyOf(masterKey) {
   return `${baseKeyOf(masterKey)}-captions.vtt`;
 }
 
+// Must match the prefix film-media-worker's abr-transcode.yml uploads
+// its output to — see that workflow's "Upload HLS output to storage"
+// step.
+function hlsPrefixOf(filmId) {
+  return `uploads/${filmId}/hls/`;
+}
+
 /**
  * Deletes a film and everything it owns. Returns `null` if no film with
  * that id exists (mirrors filmService's other lookup functions);
@@ -79,7 +84,9 @@ function captionsKeyOf(masterKey) {
  * log/report with), `steps` records the outcome of each best-effort
  * cleanup step: each value is "ok", "partial", "failed", or "skipped"
  * (skipped meaning the step didn't apply to this film at all — e.g. an
- * archive.org-sourced film has no storageProvider/masterKey to clean up).
+ * archive.org-sourced film has no storageProvider/masterKey to clean up,
+ * or a film whose ABR job never ran has no HLS folder or output bytes to
+ * release).
  */
 async function deleteFilm(filmId) {
   const film = await Film.findById(filmId);
@@ -89,7 +96,9 @@ async function deleteFilm(filmId) {
     masterDelete: "skipped",
     thumbPreviewDelete: "skipped",
     captionsDelete: "skipped",
+    hlsCleanup: "skipped",
     capacityRelease: "skipped",
+    abrCapacityRelease: "skipped",
     qdrantDelete: "skipped",
     categoryDecrement: "skipped",
   };
@@ -143,7 +152,22 @@ async function deleteFilm(filmId) {
       steps.captionsDelete = "failed";
     }
 
-    // --- 4. Release reserved capacity — unless already released ---
+    // --- 4. HLS ladder folder (Slice 15) ---
+    // Attempted whenever this film has a storage object at all,
+    // regardless of abrStatus — a failed or still-processing ABR run
+    // can still have left partial output in storage, and deletePrefix()
+    // is a safe no-op if the prefix never existed.
+    try {
+      await adapter.deletePrefix(hlsPrefixOf(film._id));
+      steps.hlsCleanup = "ok";
+    } catch (err) {
+      console.error(`HLS folder cleanup failed for film ${filmId}:`, err.message);
+      Sentry.captureException(err);
+      steps.hlsCleanup = "failed";
+    }
+
+    // --- 5. Release reserved master-file capacity — unless already
+    // released ---
     // A "failed" transcodeStatus means one of the two existing
     // failure-handling paths (serviceController.handleUploadCallback or
     // uploadController.createUpload's dispatch-failure branch) already
@@ -165,18 +189,34 @@ async function deleteFilm(filmId) {
     }
   }
 
-  // --- 5. Qdrant embedding — runs regardless of storage/source, since
+  // --- 6. Release ABR output capacity (Slice 15) ---
+  // Independent of hasStorageObject's guard above — releaseAbrCapacity
+  // internally no-ops if abrOutputBytes was never set, so it's safe to
+  // always attempt. No "already released" guard needed here the way
+  // step 5 needs one: abrOutputBytes is only ever added once, by the ABR
+  // success callback, never re-added, so there's no double-release risk
+  // to guard against.
+  try {
+    await releaseAbrCapacity(film);
+    steps.abrCapacityRelease = typeof film.abrOutputBytes === "number" ? "ok" : "skipped";
+  } catch (err) {
+    // releaseAbrCapacity already logs/captures its own errors internally
+    // and never throws — this catch exists only as a defensive backstop.
+    steps.abrCapacityRelease = "failed";
+  }
+
+  // --- 7. Qdrant embedding — runs regardless of storage/source, since
   // any approved film (archive.org or own-upload) can be indexed. ---
   await deleteFilmEmbedding(film._id);
   steps.qdrantDelete = "ok";
 
-  // --- 6. Category count — only if this film was actually counted ---
+  // --- 8. Category count — only if this film was actually counted ---
   if (film.status === "approved") {
     await decrementCategoryCounts(film.category);
     steps.categoryDecrement = "ok";
   }
 
-  // --- 7. The Mongo document itself, last — always runs, regardless of
+  // --- 9. The Mongo document itself, last — always runs, regardless of
   // how any step above went. ---
   await Film.findByIdAndDelete(filmId);
 

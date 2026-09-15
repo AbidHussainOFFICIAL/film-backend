@@ -50,6 +50,10 @@ router.post("/uploads", uploadController.createUpload);
 // POST /api/admin/uploads/:id/retry-processing
 router.post("/uploads/:id/retry-processing", uploadController.retryProcessing);
 
+// POST /api/admin/uploads/:id/generate-abr (Slice 15) — manually
+// (re)dispatches multi-quality streaming generation for a film.
+router.post("/uploads/:id/generate-abr", uploadController.generateAbr);
+
 // POST /api/admin/qdrant/init — synchronous wrapper around
 // services/qdrantService.ensureCollection(), so the admin storage page
 // can (re)initialize the search collection without needing shell access

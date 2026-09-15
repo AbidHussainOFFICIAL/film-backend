@@ -2,20 +2,27 @@
  * backend/services/storage.js
  *
  * Cloudflare R2 helper functions used OUTSIDE the multi-provider storage
- * router: uploading the small VTT captions file, and presigning the
+ * router: uploading the small VTT captions file, presigning the
  * Android APK's fixed-key release asset (see
- * controllers/serviceController.js's getApkUploadUrl). Own-upload film
+ * controllers/serviceController.js's getApkUploadUrl), and (Slice 15)
+ * deleting an entire HLS output folder by prefix. Own-upload film
  * masters no longer call this file directly — see services/storageRouter.js
  * + adapters/R2Adapter.js, which wraps getFixedUploadUrl() / getPublicUrl()
- * / deleteObject() below to satisfy the shared StorageAdapter interface
- * alongside B2Adapter/StorjAdapter.
+ * / deleteObject() / deletePrefix() below to satisfy the shared
+ * StorageAdapter interface alongside B2Adapter/StorjAdapter.
  *
  * (The old random-key getUploadUrl()/buildKey() functions that used to
  * live here were removed — storageRouter.js now owns key generation for
  * routed uploads, and nothing else called them.)
  */
 
-const { S3Client, PutObjectCommand, DeleteObjectCommand } = require("@aws-sdk/client-s3");
+const {
+  S3Client,
+  PutObjectCommand,
+  DeleteObjectCommand,
+  ListObjectsV2Command,
+  DeleteObjectsCommand,
+} = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 
 const R2_ACCOUNT_ID = process.env.R2_ACCOUNT_ID;
@@ -118,8 +125,8 @@ async function uploadBuffer(key, body, contentType) {
 }
 
 /**
- * Deletes an object from R2 — used by R2Adapter.delete() to satisfy the
- * shared StorageAdapter interface.
+ * Deletes a single object from R2 — used by R2Adapter.delete() to
+ * satisfy the shared StorageAdapter interface.
  */
 async function deleteObject(key) {
   const bucket = requireBucket();
@@ -127,9 +134,46 @@ async function deleteObject(key) {
   await c.send(new DeleteObjectCommand({ Bucket: bucket, Key: key }));
 }
 
+/**
+ * Slice 15 — deletes every object under a given key prefix, e.g.
+ * "uploads/{filmId}/hls/". An ABR-generated HLS ladder is a whole folder
+ * of files (master playlist, per-rendition playlists, every segment,
+ * audio-group playlists), not a single known key, so this lists the
+ * prefix and bulk-deletes everything found under it. Paginates via
+ * ListObjectsV2's ContinuationToken in case a folder ever exceeds 1000
+ * objects (S3's per-request listing limit) — unlikely for a single
+ * film's ladder, but correct to handle rather than silently truncate
+ * and leave the rest orphaned. A no-op (nothing to list) is not an
+ * error — used by R2Adapter.deletePrefix() to satisfy the shared
+ * StorageAdapter interface.
+ */
+async function deletePrefix(prefix) {
+  const bucket = requireBucket();
+  const c = getClient();
+
+  let continuationToken;
+  do {
+    const listed = await c.send(
+      new ListObjectsV2Command({
+        Bucket: bucket,
+        Prefix: prefix,
+        ContinuationToken: continuationToken,
+      })
+    );
+
+    const objects = (listed.Contents || []).map((obj) => ({ Key: obj.Key }));
+    if (objects.length > 0) {
+      await c.send(new DeleteObjectsCommand({ Bucket: bucket, Delete: { Objects: objects } }));
+    }
+
+    continuationToken = listed.IsTruncated ? listed.NextContinuationToken : undefined;
+  } while (continuationToken);
+}
+
 module.exports = {
   getFixedUploadUrl,
   uploadBuffer,
   getPublicUrl,
   deleteObject,
+  deletePrefix,
 };

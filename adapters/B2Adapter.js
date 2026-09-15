@@ -20,7 +20,13 @@
  * avoid a fragile guess if Backblaze ever changes that hostname format.
  */
 
-const { S3Client, PutObjectCommand, DeleteObjectCommand } = require("@aws-sdk/client-s3");
+const {
+  S3Client,
+  PutObjectCommand,
+  DeleteObjectCommand,
+  ListObjectsV2Command,
+  DeleteObjectsCommand,
+} = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 const StorageAdapter = require("./StorageAdapter");
 
@@ -94,6 +100,35 @@ class B2Adapter extends StorageAdapter {
     const bucket = this._requireBucket();
     const client = this._getClient();
     await client.send(new DeleteObjectCommand({ Bucket: bucket, Key: key }));
+  }
+
+  /**
+   * Slice 15 — see StorageAdapter.deletePrefix() for why this exists.
+   * Self-contained (unlike R2Adapter, which delegates to storage.js)
+   * since this adapter already owns its own S3 client, same as its
+   * other methods above.
+   */
+  async deletePrefix(prefix) {
+    const bucket = this._requireBucket();
+    const client = this._getClient();
+
+    let continuationToken;
+    do {
+      const listed = await client.send(
+        new ListObjectsV2Command({
+          Bucket: bucket,
+          Prefix: prefix,
+          ContinuationToken: continuationToken,
+        })
+      );
+
+      const objects = (listed.Contents || []).map((obj) => ({ Key: obj.Key }));
+      if (objects.length > 0) {
+        await client.send(new DeleteObjectsCommand({ Bucket: bucket, Delete: { Objects: objects } }));
+      }
+
+      continuationToken = listed.IsTruncated ? listed.NextContinuationToken : undefined;
+    } while (continuationToken);
   }
 }
 

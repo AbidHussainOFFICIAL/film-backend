@@ -19,9 +19,29 @@
  * region — Storj's gateway doesn't have region-specific endpoints the
  * way AWS does, but the SDK's SigV4 signer still needs *some* stable
  * region value to sign against.
+ *
+ * Both requestChecksumCalculation AND responseChecksumValidation are set
+ * to "WHEN_REQUIRED" below — not just the request side. Newer AWS SDK
+ * versions default to computing/validating checksums on both the
+ * request AND the response, and Storj's gateway rejects requests
+ * carrying that unsupported functionality outright with "A header you
+ * provided implies functionality that is not implemented" (confirmed in
+ * practice running scripts/setStorjCors.js against a real bucket — see
+ * that script's header comment for the fuller story). Every other S3
+ * client in this codebase (storage.js/B2Adapter) only needed the
+ * request-side setting; Storj specifically needs both, matching the
+ * aws-cli equivalent (AWS_REQUEST_CHECKSUM_CALCULATION +
+ * AWS_RESPONSE_CHECKSUM_VALIDATION) already used against Storj in
+ * film-media-worker's process-upload.yml and abr-transcode.yml.
  */
 
-const { S3Client, PutObjectCommand, DeleteObjectCommand } = require("@aws-sdk/client-s3");
+const {
+  S3Client,
+  PutObjectCommand,
+  DeleteObjectCommand,
+  ListObjectsV2Command,
+  DeleteObjectsCommand,
+} = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 const StorageAdapter = require("./StorageAdapter");
 
@@ -53,10 +73,11 @@ class StorjAdapter extends StorageAdapter {
         // Storj's gateway expects the bucket in the path, not as a
         // virtual-hosted subdomain of the endpoint.
         forcePathStyle: true,
-        // See storage.js's identical comment — newer AWS SDK versions
-        // default to auto-computing a request checksum that most
-        // non-AWS S3-compatible providers don't reliably support.
+        // See this file's header comment — Storj specifically needs
+        // BOTH the request and response checksum settings relaxed,
+        // unlike R2/B2 which only needed the request side.
         requestChecksumCalculation: "WHEN_REQUIRED",
+        responseChecksumValidation: "WHEN_REQUIRED",
       });
     }
     return this._client;
@@ -98,6 +119,33 @@ class StorjAdapter extends StorageAdapter {
     const bucket = this._requireBucket();
     const client = this._getClient();
     await client.send(new DeleteObjectCommand({ Bucket: bucket, Key: key }));
+  }
+
+  /**
+   * Slice 15 — see StorageAdapter.deletePrefix() for why this exists.
+   * Self-contained, same as B2Adapter's equivalent.
+   */
+  async deletePrefix(prefix) {
+    const bucket = this._requireBucket();
+    const client = this._getClient();
+
+    let continuationToken;
+    do {
+      const listed = await client.send(
+        new ListObjectsV2Command({
+          Bucket: bucket,
+          Prefix: prefix,
+          ContinuationToken: continuationToken,
+        })
+      );
+
+      const objects = (listed.Contents || []).map((obj) => ({ Key: obj.Key }));
+      if (objects.length > 0) {
+        await client.send(new DeleteObjectsCommand({ Bucket: bucket, Delete: { Objects: objects } }));
+      }
+
+      continuationToken = listed.IsTruncated ? listed.NextContinuationToken : undefined;
+    } while (continuationToken);
   }
 }
 

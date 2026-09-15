@@ -23,6 +23,10 @@ class R2Adapter extends StorageAdapter {
   async delete(key) {
     return storage.deleteObject(key);
   }
+
+  async deletePrefix(prefix) {
+    return storage.deletePrefix(prefix);
+  }
 }
 
 // Stateless (reads env at call time via storage.js) — safe to share one

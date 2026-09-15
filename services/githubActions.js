@@ -55,6 +55,22 @@ function triggerUploadProcessing(filmId, masterKey, storageProvider) {
   });
 }
 
+/**
+ * Slice 15 — dispatches the separate, much longer-running ABR
+ * (adaptive-bitrate) transcode workflow. Same input shape as
+ * triggerUploadProcessing above (film_id/master_key/storage_provider) —
+ * the worker downloads the same master file a second time and produces
+ * a multi-resolution, multi-audio HLS ladder from it, entirely
+ * independent of the fast thumbnail/preview job.
+ */
+function triggerAbrTranscode(filmId, masterKey, storageProvider) {
+  return triggerWorkflow("abr-transcode.yml", {
+    film_id: String(filmId),
+    master_key: masterKey,
+    storage_provider: storageProvider,
+  });
+}
+
 function triggerIngest(jobRunId) {
   return triggerWorkflow("ingest.yml", { job_run_id: String(jobRunId) });
 }
@@ -66,6 +82,7 @@ function triggerQdrantReindex(jobRunId) {
 module.exports = {
   triggerWorkflow,
   triggerUploadProcessing,
+  triggerAbrTranscode,
   triggerIngest,
   triggerQdrantReindex,
 };

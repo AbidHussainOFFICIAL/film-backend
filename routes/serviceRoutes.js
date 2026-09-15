@@ -24,11 +24,16 @@ router.post("/jobs/:id/complete", serviceController.completeJob);
 
 router.post("/uploads/:id/callback", serviceController.handleUploadCallback);
 
-// POST /api/service/transcodes/reconcile-stuck (Slice 14) — called every
-// 30 minutes by film-media-worker's reconcile-transcodes.yml cron. Finds
-// own-uploads stuck in transcodeStatus: "processing" past a timeout,
-// retries once, then gives up and marks them failed.
-router.post("/transcodes/reconcile-stuck", serviceController.reconcileStuckTranscodes);
+// POST /api/service/uploads/:id/abr-callback (Slice 15) — the separate
+// ABR (adaptive-bitrate) transcode job's own completion callback,
+// called by film-media-worker's abr-transcode.yml.
+router.post("/uploads/:id/abr-callback", serviceController.handleAbrCallback);
+
+// POST /api/service/transcodes/reconcile-stuck — called every 30
+// minutes by film-media-worker's reconcile-transcodes.yml cron. Covers
+// both the thumbnail/preview job (Slice 14) and the ABR job (Slice 15)
+// in one pass — see serviceController.reconcileStuckJobs.
+router.post("/transcodes/reconcile-stuck", serviceController.reconcileStuckJobs);
 
 // GET /api/service/apk/upload-url — called by film-frontend's
 // build-apk.yml to get a presigned R2 upload URL for the built APK.
