@@ -303,8 +303,8 @@ async function handleUploadCallback(req, res) {
       film.status = "approved";
       film.verifiedDate = new Date();
 
-      // Slice 15: now that sourceHeight is known, decide whether to
-      // dispatch the separate ABR job. See decideAndDispatchAbr above.
+      // Now that sourceHeight is known, decide whether to dispatch the
+      // separate ABR job. See decideAndDispatchAbr above.
       await decideAndDispatchAbr(film);
 
       await film.save();
@@ -426,11 +426,12 @@ async function runPostApprovalSideEffects(film) {
 }
 
 // ---------------------------------------------------------------------
-// Slice 15 — ABR (adaptive bitrate) transcode callback
+// ABR (adaptive bitrate) transcode callback — Slice 15, extended by
+// Slice 16 to also resolve subtitleTracks
 // ---------------------------------------------------------------------
 
 // POST /api/service/uploads/:id/abr-callback
-// Body on success: { status: "completed", manifestKey, renditions: [{resolution,height,bitrateKbps,key,segmentCount}], audioTracks: [{index,language,label,isDefault}], totalOutputBytes }
+// Body on success: { status: "completed", manifestKey, renditions: [{resolution,height,bitrateKbps,key,segmentCount}], audioTracks: [{index,language,label,isDefault}], subtitleTracks: [{index,language,label,key}], totalOutputBytes }
 // Body on failure: { status: "failed", error }
 //
 // Entirely separate from handleUploadCallback above — this is the much
@@ -442,7 +443,7 @@ async function runPostApprovalSideEffects(film) {
 async function handleAbrCallback(req, res) {
   try {
     const { id } = req.params;
-    const { status, manifestKey, renditions, audioTracks, totalOutputBytes, error } = req.body;
+    const { status, manifestKey, renditions, audioTracks, subtitleTracks, totalOutputBytes, error } = req.body;
 
     const film = await Film.findById(id);
     if (!film) {
@@ -472,6 +473,22 @@ async function handleAbrCallback(req, res) {
         codec: "h264",
       }));
       film.audioTracks = Array.isArray(audioTracks) ? audioTracks : [];
+
+      // Slice 16 — embedded subtitle tracks extracted by the same ABR
+      // job (never AI-generated). Empty/absent whenever the source had
+      // no usable (text-based) embedded subtitle streams — this is the
+      // common case, not an error. Each track's key is resolved to a
+      // public URL the same way each rendition's key already is above.
+      film.subtitleTracks = Array.isArray(subtitleTracks)
+        ? subtitleTracks.map((t) => ({
+            index: t.index,
+            language: t.language,
+            label: t.label,
+            key: t.key,
+            url: adapter.getPublicUrl(t.key),
+          }))
+        : [];
+
       film.abrStatus = "completed";
       film.abrError = undefined;
 
@@ -512,7 +529,7 @@ async function handleAbrCallback(req, res) {
 }
 
 // ---------------------------------------------------------------------
-// Slice 14/15 — stuck-job reconciliation (thumbnail/preview + ABR)
+// Stuck-job reconciliation (thumbnail/preview + ABR)
 // ---------------------------------------------------------------------
 
 // Thumbnail/preview jobs (Slice 14) — retries once via the same
@@ -604,8 +621,8 @@ async function reconcileStuckAbrJobs() {
 // (every 30 minutes) — not admin-triggerable and not a JobRun, this is a
 // pure background maintenance sweep, same trust boundary as every other
 // /api/service/* route (verifyServiceSecret, not Firebase). Covers both
-// independent job types (thumbnail/preview, and Slice 15's ABR job) in
-// one pass rather than two separate near-identical sweeps/endpoints.
+// independent job types (thumbnail/preview, and the ABR job) in one pass
+// rather than two separate near-identical sweeps/endpoints.
 async function reconcileStuckJobs(req, res) {
   try {
     const transcode = await reconcileStuckTranscodeJobs();
