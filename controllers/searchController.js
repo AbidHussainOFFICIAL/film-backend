@@ -4,6 +4,7 @@ const Sentry = require("@sentry/node");
 const filmService = require("../services/filmService");
 const { getEmbedding } = require("../services/embedding");
 const { searchSimilarFilms } = require("../services/qdrantService");
+const { toPublicFilmSummaries } = require("../services/publicFilmView");
 
 const MAX_LIMIT = 50;
 const DEFAULT_LIMIT = 20;
@@ -25,12 +26,15 @@ async function searchFilms(req, res) {
     // payload. Fetch the real documents from Mongo (so we always return
     // current, approved data) but preserve Qdrant's relevance ordering.
     const orderedIds = results.map((r) => r.payload?.filmId).filter(Boolean);
-    const films = await filmService.getFilmsByIds(orderedIds);
+    const films = await filmService.getFilmSummariesByIds(orderedIds);
     const filmById = new Map(films.map((f) => [String(f._id), f]));
 
     const ordered = orderedIds.map((id) => filmById.get(id)).filter(Boolean);
 
-    res.json(ordered);
+    // Public route, same as GET /api/films — same lean summary shape
+    // and field whitelist, so search results never leak verifiedBy,
+    // archiveBackup.archiveIdentifier, masterKey, etc.
+    res.json(toPublicFilmSummaries(ordered));
   } catch (err) {
     console.error("Search error:", err);
     Sentry.captureException(err);

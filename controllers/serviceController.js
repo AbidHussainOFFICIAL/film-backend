@@ -8,12 +8,11 @@ const filmService = require("../services/filmService");
 const ingestionService = require("../services/ingestionService");
 const storage = require("../services/storage");
 const { getAdapter } = require("../services/adapterRegistry");
-const { postFilmToTelegram } = require("../services/telegram");
-const { postFilmToChannel } = require("../services/whatsapp");
 const { backupFilmToArchiveOrg } = require("../services/archiveBackup");
 const { incrementCategoryCounts } = require("../services/categoryService");
 const { triggerUploadProcessing, triggerAbrTranscode } = require("../services/githubActions");
 const { releaseReservedCapacity } = require("../services/storageCapacityService");
+const { maybeCleanupMaster } = require("../services/masterCleanupService");
 const { withTimeout } = require("../utils/withTimeout");
 
 // Fixed R2 key for the Android APK release asset — always overwritten in
@@ -23,10 +22,9 @@ const { withTimeout } = require("../utils/withTimeout");
 const APK_STORAGE_KEY = process.env.APK_STORAGE_KEY || "releases/reel-vault.apk";
 const APK_CONTENT_TYPE = "application/vnd.android.package-archive";
 
-// Hard ceiling for each best-effort post-approval side effect. See
-// utils/withTimeout.js — a try/catch alone only protects against a
-// THROW, not a HANG (WhatsApp's postFilmToChannel in particular can
-// hang indefinitely if its persistent session isn't currently live).
+// Hard ceiling for the one remaining best-effort post-approval side
+// effect (Archive.org backup). See utils/withTimeout.js — a try/catch
+// alone only protects against a THROW, not a HANG.
 const SIDE_EFFECT_TIMEOUT_MS = 6 * 60 * 1000; // 6 minutes
 
 // Slice 14 — how long a film can sit in transcodeStatus: "processing"
@@ -43,6 +41,11 @@ const STUCK_TRANSCODE_THRESHOLD_MS = 150 * 60 * 1000; // 150 minutes
 // same "job's own ceiling + ~30 minute callback buffer" logic as above,
 // just against the longer ceiling.
 const STUCK_ABR_THRESHOLD_MS = 330 * 60 * 1000; // 330 minutes
+
+// Slice 18 — how long an Archive.org backup may sit at "pending" before
+// the sweep treats it as dead. Comfortably past the upload's own
+// 10-minute IAS3 timeout.
+const STUCK_BACKUP_THRESHOLD_MS = 30 * 60 * 1000; // 30 minutes
 
 // Slice 15 — the floor below which multi-quality streaming isn't
 // attempted at all (nothing to ladder below this). Duplicated (in
@@ -108,15 +111,25 @@ async function listFilmsForEmbedding(req, res) {
 
 // GET /api/service/films/for-link-check
 // Used by film-media-worker's checkLinks.js — returns just enough for the
-// heavy backend to HEAD-check every approved film's stream URL, without
-// exposing anything else about the film.
+// heavy backend to HEAD-check every approved film's playable URL,
+// without exposing anything else about the film. The field is still
+// called `streamUrl` in the response (that's the key checkLinks.js
+// reads); Slice 18 — for a film whose original master has been cleaned
+// up (streamUrl unset) it carries the HLS manifest URL instead, so
+// HLS-only films are still health-checked rather than silently skipped.
 async function listFilmsForLinkCheck(req, res) {
   try {
     const films = await Film.find(
-      { status: "approved", streamUrl: { $exists: true, $ne: null } },
-      { streamUrl: 1 }
+      {
+        status: "approved",
+        $or: [
+          { streamUrl: { $exists: true, $ne: null } },
+          { manifestUrl: { $exists: true, $ne: null } },
+        ],
+      },
+      { streamUrl: 1, manifestUrl: 1 }
     );
-    res.json(films.map((f) => ({ filmId: f._id, streamUrl: f.streamUrl })));
+    res.json(films.map((f) => ({ filmId: f._id, streamUrl: f.streamUrl || f.manifestUrl })));
   } catch (err) {
     console.error("Error listing films for link check:", err);
     Sentry.captureException(err);
@@ -224,9 +237,12 @@ async function completeJob(req, res) {
 // decoupled/fire-and-forget like runPostApprovalSideEffects further
 // down): it's a single fast GitHub API dispatch call, the same kind of
 // call triggerUploadProcessing already makes elsewhere in this codebase,
-// not a potentially slow/hanging integration like Telegram/WhatsApp.
-// Does not save() — the caller saves once, after this and every other
-// field on `film` for this callback have been set.
+// not a potentially slow/hanging integration. Does not save() — the
+// caller saves once, after this and every other field on `film` for this
+// callback have been set. The master is always still live at this exact
+// point (nothing has cleaned it up yet), so this dispatches directly —
+// no Archive.org-fallback resolution needed here (see
+// masterSourceResolver.js's header comment).
 async function decideAndDispatchAbr(film) {
   if (!film.abrRequested) {
     film.abrStatus = "not_applicable";
@@ -240,7 +256,7 @@ async function decideAndDispatchAbr(film) {
   }
 
   try {
-    await triggerAbrTranscode(film._id, film.masterKey, film.storageProvider);
+    await triggerAbrTranscode(film._id, { masterKey: film.masterKey, storageProvider: film.storageProvider });
     film.abrStatus = "processing";
     film.abrStartedAt = new Date();
     film.abrError = undefined;
@@ -311,13 +327,11 @@ async function handleUploadCallback(req, res) {
 
       // Respond to the caller (process-upload.yml's "Report success to
       // backend" step) immediately, right after the film update is
-      // safely persisted — do NOT make that curl call wait on Telegram,
-      // WhatsApp, or the Archive.org backup below. Those can legitimately
-      // take anywhere from seconds to several minutes (WhatsApp in
-      // particular can hang far longer than that if its persistent
-      // session isn't currently live — see services/whatsapp.js), and a
-      // slow/hung side effect here should never be able to make CI think
-      // the whole upload failed when the film itself already saved fine.
+      // safely persisted — do NOT make that curl call wait on the
+      // Archive.org backup below, which can legitimately take anywhere
+      // from seconds to several minutes. A slow side effect here should
+      // never be able to make CI think the whole upload failed when the
+      // film itself already saved fine.
       res.json({ ok: true });
 
       runPostApprovalSideEffects(film).catch((err) => {
@@ -375,10 +389,17 @@ async function runPostApprovalSideEffects(film) {
   // unconditionally, no timeout needed.
   await incrementCategoryCounts(film.category);
 
-  // Archive.org backup runs next — deliberately ordered ahead of
-  // WhatsApp/Telegram so a hung or slow WhatsApp connection can never
-  // delay this permanent-record backup. Best-effort like the rest.
+  // Archive.org backup — this app's only off-site copy of an
+  // own-upload's true original file. Best-effort like everything else
+  // here: the film is already approved/playable regardless of how this
+  // goes. startedAt is recorded up front so that, if the server dies
+  // mid-upload, the reconciliation sweep can tell this attempt apart
+  // from "never tried" and flip it to failed (making the Retry backup
+  // button available) instead of leaving it "pending" forever.
   try {
+    film.archiveBackup = { pushed: false, status: "pending", startedAt: new Date() };
+    await film.save();
+
     const identifier = await withTimeout(
       backupFilmToArchiveOrg(film),
       SIDE_EFFECT_TIMEOUT_MS,
@@ -402,36 +423,23 @@ async function runPostApprovalSideEffects(film) {
     await film.save().catch(() => {});
   }
 
-  try {
-    await withTimeout(postFilmToChannel(film), SIDE_EFFECT_TIMEOUT_MS, "WhatsApp post");
-    film.whatsappPost = { pushed: true, status: "completed", pushedDate: new Date() };
-    await film.save().catch(() => {});
-  } catch (whatsappErr) {
-    console.error(`WhatsApp post failed for film ${id}:`, whatsappErr.message);
-    Sentry.captureException(whatsappErr);
-    film.whatsappPost = { pushed: false, status: "failed", error: whatsappErr.message };
-    await film.save().catch(() => {});
-  }
-
-  try {
-    await withTimeout(postFilmToTelegram(film), SIDE_EFFECT_TIMEOUT_MS, "Telegram post");
-    film.telegramPost = { pushed: true, status: "completed", pushedDate: new Date() };
-    await film.save().catch(() => {});
-  } catch (telegramErr) {
-    console.error(`Telegram post failed for film ${id}:`, telegramErr.message);
-    Sentry.captureException(telegramErr);
-    film.telegramPost = { pushed: false, status: "failed", error: telegramErr.message };
-    await film.save().catch(() => {});
-  }
+  // Slice 17 — this may be the second of the two conditions
+  // (abrStatus === "completed", archiveBackup.status === "completed")
+  // that together allow the original master to be cleaned up — see
+  // masterCleanupService.js. Safe to call unconditionally: it checks
+  // both conditions itself and no-ops otherwise (including when the
+  // Archive.org backup above just failed).
+  await maybeCleanupMaster(id);
 }
 
 // ---------------------------------------------------------------------
 // ABR (adaptive bitrate) transcode callback — Slice 15, extended by
-// Slice 16 to also resolve subtitleTracks
+// Slice 16 to also resolve subtitleTracks, and by Slice 17 to record
+// topQualityKey and trigger a master-cleanup check
 // ---------------------------------------------------------------------
 
 // POST /api/service/uploads/:id/abr-callback
-// Body on success: { status: "completed", manifestKey, renditions: [{resolution,height,bitrateKbps,key,segmentCount}], audioTracks: [{index,language,label,isDefault}], subtitleTracks: [{index,language,label,key}], totalOutputBytes }
+// Body on success: { status: "completed", manifestKey, renditions: [{resolution,height,bitrateKbps,key,segmentCount}], audioTracks: [{index,language,label,isDefault}], subtitleTracks: [{index,language,label,key}], topQualityKey, totalOutputBytes }
 // Body on failure: { status: "failed", error }
 //
 // Entirely separate from handleUploadCallback above — this is the much
@@ -443,7 +451,16 @@ async function runPostApprovalSideEffects(film) {
 async function handleAbrCallback(req, res) {
   try {
     const { id } = req.params;
-    const { status, manifestKey, renditions, audioTracks, subtitleTracks, totalOutputBytes, error } = req.body;
+    const {
+      status,
+      manifestKey,
+      renditions,
+      audioTracks,
+      subtitleTracks,
+      topQualityKey,
+      totalOutputBytes,
+      error,
+    } = req.body;
 
     const film = await Film.findById(id);
     if (!film) {
@@ -451,8 +468,10 @@ async function handleAbrCallback(req, res) {
     }
 
     if (status === "completed") {
-      if (!manifestKey || !Array.isArray(renditions) || renditions.length === 0) {
-        return res.status(400).json({ error: "Missing manifestKey/renditions for a completed ABR callback" });
+      if (!manifestKey || !topQualityKey || !Array.isArray(renditions) || renditions.length === 0) {
+        return res
+          .status(400)
+          .json({ error: "Missing manifestKey/topQualityKey/renditions for a completed ABR callback" });
       }
       if (!film.storageProvider) {
         return res
@@ -489,27 +508,53 @@ async function handleAbrCallback(req, res) {
           }))
         : [];
 
+      // Slice 17 — the flat, single-file remux/encode of the top rung,
+      // produced unconditionally alongside the ladder (see worker's
+      // buildAbrLadder.sh). Not resolved to a public URL / written into
+      // downloadUrl yet — that only happens once (if ever) the original
+      // master is actually cleaned up, via masterCleanupService.js. The
+      // key itself is recorded now so that function has it on hand.
+      film.topQualityKey = topQualityKey;
+
       film.abrStatus = "completed";
       film.abrError = undefined;
 
       if (typeof totalOutputBytes === "number") {
+        // A first-time ladder adds its full size to the provider's used
+        // bytes. A REGENERATION (an admin re-running an already-completed
+        // ladder) overwrites the same object keys, so the provider
+        // already counts the previous run's bytes — only the difference
+        // is added, otherwise every regeneration would permanently
+        // inflate the provider's usage by another full ladder.
+        const previousBytes = typeof film.abrOutputBytes === "number" ? film.abrOutputBytes : 0;
+        const deltaBytes = totalOutputBytes - previousBytes;
         film.abrOutputBytes = totalOutputBytes;
         // Counted against the provider now, for real, using the actual
         // reported size — unlike the master file's capacity (reserved
         // upfront, before the bytes exist, since that upload is
         // presigned and race-prone), there's no race to guard against
         // here: this is a backend-dispatched job whose outcome is only
-        // known after the fact, so it's simply added once it's known.
-        await Provider.updateOne(
-          { name: film.storageProvider },
-          { $inc: { usedBytes: totalOutputBytes } }
-        ).catch((provErr) => {
-          console.error(`Failed to account for ABR output size for film ${id}:`, provErr.message);
-          Sentry.captureException(provErr);
-        });
+        // known after the fact.
+        if (deltaBytes !== 0) {
+          await Provider.updateOne(
+            { name: film.storageProvider },
+            { $inc: { usedBytes: deltaBytes } }
+          ).catch((provErr) => {
+            console.error(`Failed to account for ABR output size for film ${id}:`, provErr.message);
+            Sentry.captureException(provErr);
+          });
+        }
       }
 
       await film.save();
+
+      // Slice 17 — this may be the second of the two conditions that
+      // together allow the original master to be cleaned up — see
+      // masterCleanupService.js. Fast (one DB read, at most one storage
+      // delete + one DB write), so unlike the Archive.org backup step,
+      // no need to decouple this from the response.
+      await maybeCleanupMaster(id);
+
       return res.json({ ok: true });
     }
 
@@ -535,7 +580,12 @@ async function handleAbrCallback(req, res) {
 // Thumbnail/preview jobs (Slice 14) — retries once via the same
 // triggerUploadProcessing() dispatch used everywhere else in this app,
 // then gives up and marks the film "failed" (releasing its reserved
-// storage capacity) if it's still stuck on a second pass.
+// storage capacity) if it's still stuck on a second pass. This sweep
+// only ever touches films still in transcodeStatus: "processing" — by
+// construction, a master can only ever be cleaned up (Slice 17) after
+// transcodeStatus has already reached "completed", so a film reachable
+// here is guaranteed to still have a live master; no Archive.org
+// fallback is needed in this function.
 async function reconcileStuckTranscodeJobs() {
   const cutoff = new Date(Date.now() - STUCK_TRANSCODE_THRESHOLD_MS);
   const stuckFilms = await Film.find({
@@ -589,11 +639,12 @@ async function reconcileStuckTranscodeJobs() {
 // minutes) and meaningfully more expensive per attempt than the fast
 // thumbnail/preview job, so silently auto-retrying a job this costly on
 // a timer is a real CI-minutes decision better left to the admin's
-// explicit "Generate multi-quality" action (uploadController.generateAbr)
-// than to an automatic sweep. A stuck ABR job goes straight to "failed"
-// — the film's direct-file playback is completely unaffected either way,
-// and no capacity needs releasing since ABR output bytes are only ever
-// added on a SUCCESS callback, never reserved upfront.
+// explicit "Regenerate multi-quality" action (uploadController.
+// generateAbr) than to an automatic sweep. A stuck ABR job goes straight
+// to "failed" — the film's direct-file playback is completely
+// unaffected either way, and no capacity needs releasing since ABR
+// output bytes are only ever added on a SUCCESS callback, never reserved
+// upfront.
 async function reconcileStuckAbrJobs() {
   const cutoff = new Date(Date.now() - STUCK_ABR_THRESHOLD_MS);
   const stuckFilms = await Film.find({
@@ -615,19 +666,69 @@ async function reconcileStuckAbrJobs() {
   return { checked: stuckFilms.length, retried: 0, failed };
 }
 
+// Slice 18 — an Archive.org backup attempt that started but never
+// finished (the server was restarted or crashed mid-upload, so neither
+// the success nor the failure branch ever ran) would otherwise sit at
+// status "pending" forever — invisible to the admin and with no Retry
+// backup button. runPostApprovalSideEffects / the retry action record
+// startedAt; anything still pending well past the upload's own internal
+// timeouts (6 min side-effect ceiling, 10 min IAS3 ceiling) is flipped
+// to "failed" so the button appears.
+async function reconcileStuckBackups() {
+  const cutoff = new Date(Date.now() - STUCK_BACKUP_THRESHOLD_MS);
+  const result = await Film.updateMany(
+    { "archiveBackup.status": "pending", "archiveBackup.startedAt": { $lte: cutoff } },
+    {
+      $set: {
+        "archiveBackup.status": "failed",
+        "archiveBackup.error": "Backup did not finish (the server may have restarted mid-upload) — safe to retry.",
+      },
+    }
+  );
+  return { failed: result.modifiedCount };
+}
+
+// Slice 18 — retries master cleanup for any film that already has
+// everything it needs except a verified backup (or whose cleanup was
+// deferred/errored the first time). See masterCleanupService.js.
+// Films that finished ABR before top_quality.mp4 existed have no
+// topQualityKey and are deliberately excluded — they become eligible
+// after the admin regenerates their ladder once.
+async function reconcileMasterCleanup() {
+  const candidates = await Film.find(
+    {
+      abrStatus: "completed",
+      "archiveBackup.status": "completed",
+      masterKey: { $exists: true, $ne: null },
+      masterDeletedAt: { $exists: false },
+      topQualityKey: { $exists: true, $ne: null },
+    },
+    { _id: 1 }
+  );
+
+  let cleaned = 0;
+  for (const candidate of candidates) {
+    if ((await maybeCleanupMaster(candidate._id)) === "cleaned") cleaned += 1;
+  }
+  return { checked: candidates.length, cleaned };
+}
+
 // POST /api/service/transcodes/reconcile-stuck
 //
 // Called on a schedule by film-media-worker's reconcile-transcodes.yml
 // (every 30 minutes) — not admin-triggerable and not a JobRun, this is a
 // pure background maintenance sweep, same trust boundary as every other
 // /api/service/* route (verifyServiceSecret, not Firebase). Covers both
-// independent job types (thumbnail/preview, and the ABR job) in one pass
-// rather than two separate near-identical sweeps/endpoints.
+// independent job types (thumbnail/preview, and the ABR job) plus, as of
+// Slice 18, stuck Archive.org backups and deferred master cleanups, in
+// one pass rather than separate near-identical sweeps/endpoints.
 async function reconcileStuckJobs(req, res) {
   try {
     const transcode = await reconcileStuckTranscodeJobs();
     const abr = await reconcileStuckAbrJobs();
-    res.json({ transcode, abr });
+    const backups = await reconcileStuckBackups();
+    const masterCleanup = await reconcileMasterCleanup();
+    res.json({ transcode, abr, backups, masterCleanup });
   } catch (err) {
     console.error("Error reconciling stuck jobs:", err);
     Sentry.captureException(err);

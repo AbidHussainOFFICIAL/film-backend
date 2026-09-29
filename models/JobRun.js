@@ -2,6 +2,12 @@
 
 const { Schema, model } = require("mongoose");
 
+// Slice 18 — finished runs older than this are pruned automatically by a
+// MongoDB TTL index (see below). The /admin/tools page only ever shows
+// the 5 most recent runs per job type, so anything older is just
+// accumulating weight in the free-tier database for no reader.
+const JOB_RUN_RETENTION_SECONDS = 90 * 24 * 60 * 60; // 90 days
+
 /**
  * Tracks admin-triggered jobs that run on the heavy backend (ingestion,
  * Qdrant reindex). This is the light backend's own bookkeeping — the
@@ -29,5 +35,7 @@ const jobRunSchema = new Schema({
 });
 
 jobRunSchema.index({ type: 1, createdAt: -1 });
+// TTL: MongoDB deletes each document once createdAt is this old.
+jobRunSchema.index({ createdAt: 1 }, { expireAfterSeconds: JOB_RUN_RETENTION_SECONDS });
 
 module.exports = model("JobRun", jobRunSchema);

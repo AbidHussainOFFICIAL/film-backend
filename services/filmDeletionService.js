@@ -5,10 +5,10 @@
  * work behind DELETE /api/admin/films/:id (see
  * controllers/filmManagementController.js, which stays a thin wrapper
  * around this). Every step here is best-effort, matching this project's
- * pattern everywhere else (Qdrant/Telegram/WhatsApp/Archive.org backup):
- * a failure in any single cleanup step never blocks the film from
- * actually being deleted — the Mongo document is always removed LAST,
- * once every other cleanup attempt has run, whether or not it succeeded.
+ * pattern everywhere else: a failure in any single cleanup step never
+ * blocks the film from actually being deleted — the Mongo document is
+ * always removed LAST, once every other cleanup attempt has run, whether
+ * or not it succeeded.
  *
  * Each step's outcome is returned in `steps` so the caller can surface a
  * partial-failure warning instead of a blanket "deleted successfully"
@@ -22,26 +22,30 @@
  * responsible for stating this plainly before this function is ever
  * called.
  *
- * Thumbnail/preview/captions object keys were never stored separately —
- * only their public URLs were (see models/Film.js) — so they're
- * reconstructed here from masterKey using the exact same naming
- * convention already used to create them:
+ * Thumbnail/preview/captions object keys: only their public URLs were
+ * ever stored at creation time, so while a film still has its masterKey
+ * they're derived from it using the fixed naming convention already used
+ * to create them:
  *   - thumb:    {base}-thumb.jpg      (film-media-worker's process-upload.yml)
  *   - preview:  {base}-preview.mp4    (same)
  *   - captions: {base}-captions.vtt   (controllers/uploadController.js's createUpload)
- * where {base} is masterKey with its file extension stripped. This is
- * reliable — the convention is fixed and used consistently in exactly
- * those two places — but inferred, not stored: if that convention ever
- * changes, older films' delete could silently miss an orphaned object.
+ * where {base} is masterKey with its file extension stripped.
+ *
+ * Slice 18 — once masterCleanupService.js deletes a master and clears
+ * masterKey, that derivation is no longer possible, so the cleanup
+ * records all three keys on the film at that moment (Film.thumbKey /
+ * previewKey / captionsKey) and this file prefers those stored keys.
+ * Either way, every own-upload's thumbnail, preview and captions are
+ * found and removed — nothing is left orphaned.
  *
  * Slice 15 addition: an ABR-generated HLS ladder lives under
  * uploads/{filmId}/hls/ (see film-media-worker's abr-transcode.yml) — a
- * whole folder of files, not a single key, and unlike the thumb/preview
- * keys above it doesn't need to be INFERRED from masterKey at all: it's
- * keyed directly by the film's own _id, which is always known and never
- * ambiguous. Cleaned up via the new StorageAdapter.deletePrefix(), and
- * its counted storage capacity (abrOutputBytes) released separately from
- * the master file's own capacity release below.
+ * whole folder of files (including, Slice 17, the flat top_quality.mp4
+ * download file), not a single key, and keyed directly by the film's
+ * own _id, so it never depends on masterKey at all. Cleaned up via
+ * StorageAdapter.deletePrefix(), and its counted storage capacity
+ * (abrOutputBytes) released separately from the master file's own
+ * capacity release below.
  */
 
 const Sentry = require("@sentry/node");
@@ -57,21 +61,22 @@ function baseKeyOf(masterKey) {
   return masterKey.replace(/\.[^/.]+$/, "");
 }
 
-function thumbKeyOf(masterKey) {
-  return `${baseKeyOf(masterKey)}-thumb.jpg`;
-}
-
-function previewKeyOf(masterKey) {
-  return `${baseKeyOf(masterKey)}-preview.mp4`;
-}
-
-function captionsKeyOf(masterKey) {
-  return `${baseKeyOf(masterKey)}-captions.vtt`;
+// Stored key (Slice 18, set at master-cleanup time) if there is one,
+// otherwise derived from masterKey while the master still exists, or
+// null if neither is possible (an archive.org film, which has none of
+// these files at all).
+function resolveDerivedKeys(film) {
+  const base = film.masterKey ? baseKeyOf(film.masterKey) : null;
+  return {
+    thumbKey: film.thumbKey || (base ? `${base}-thumb.jpg` : null),
+    previewKey: film.previewKey || (base ? `${base}-preview.mp4` : null),
+    captionsKey: film.captionsKey || (base ? `${base}-captions.vtt` : null),
+  };
 }
 
 // Must match the prefix film-media-worker's abr-transcode.yml uploads
 // its output to — see that workflow's "Upload HLS output to storage"
-// step.
+// step. Keyed by film._id alone, independent of masterKey.
 function hlsPrefixOf(filmId) {
   return `uploads/${filmId}/hls/`;
 }
@@ -84,9 +89,10 @@ function hlsPrefixOf(filmId) {
  * log/report with), `steps` records the outcome of each best-effort
  * cleanup step: each value is "ok", "partial", "failed", or "skipped"
  * (skipped meaning the step didn't apply to this film at all — e.g. an
- * archive.org-sourced film has no storageProvider/masterKey to clean up,
- * or a film whose ABR job never ran has no HLS folder or output bytes to
- * release).
+ * archive.org-sourced film has no storageProvider to clean up, an
+ * own-upload whose master was already cleaned up has no master file
+ * left to delete or capacity left to release, or a film whose ABR job
+ * never ran has no HLS folder or output bytes to release).
  */
 async function deleteFilm(filmId) {
   const film = await Film.findById(filmId);
@@ -103,12 +109,15 @@ async function deleteFilm(filmId) {
     categoryDecrement: "skipped",
   };
 
-  const hasStorageObject = Boolean(film.storageProvider && film.masterKey);
+  const hasMasterKey = Boolean(film.storageProvider && film.masterKey);
+  // storageProvider is deliberately never cleared even after the master
+  // itself is (see masterCleanupService.js), so this adapter is still
+  // resolvable for every step below regardless of masterKey.
+  const adapter = film.storageProvider ? getAdapter(film.storageProvider) : null;
+  const { thumbKey, previewKey, captionsKey } = resolveDerivedKeys(film);
 
-  if (hasStorageObject) {
-    const adapter = getAdapter(film.storageProvider);
-
-    // --- 1. Master file ---
+  // --- 1. Master file (only while it still exists) ---
+  if (hasMasterKey) {
     try {
       await adapter.delete(film.masterKey);
       steps.masterDelete = "ok";
@@ -117,46 +126,57 @@ async function deleteFilm(filmId) {
       Sentry.captureException(err);
       steps.masterDelete = "failed";
     }
+  }
 
-    // --- 2. Thumbnail + preview (derived keys, see header comment) ---
+  if (adapter) {
+    // --- 2. Thumbnail + preview ---
     // Attempted independently so one succeeding while the other fails
     // (or was never generated in the first place, e.g. a film whose
     // transcode never completed) doesn't hide the one that did work.
     let thumbOk = false;
     let previewOk = false;
-    try {
-      await adapter.delete(thumbKeyOf(film.masterKey));
-      thumbOk = true;
-    } catch (err) {
-      // Not unexpected on its own — plenty of films never had a
-      // completed transcode to generate one.
-      console.warn(`Thumbnail delete failed for film ${filmId}:`, err.message);
+    if (thumbKey) {
+      try {
+        await adapter.delete(thumbKey);
+        thumbOk = true;
+      } catch (err) {
+        // Not unexpected on its own — plenty of films never had a
+        // completed transcode to generate one.
+        console.warn(`Thumbnail delete failed for film ${filmId}:`, err.message);
+      }
     }
-    try {
-      await adapter.delete(previewKeyOf(film.masterKey));
-      previewOk = true;
-    } catch (err) {
-      console.warn(`Preview delete failed for film ${filmId}:`, err.message);
+    if (previewKey) {
+      try {
+        await adapter.delete(previewKey);
+        previewOk = true;
+      } catch (err) {
+        console.warn(`Preview delete failed for film ${filmId}:`, err.message);
+      }
     }
-    steps.thumbPreviewDelete = thumbOk && previewOk ? "ok" : thumbOk || previewOk ? "partial" : "failed";
+    if (thumbKey || previewKey) {
+      steps.thumbPreviewDelete = thumbOk && previewOk ? "ok" : thumbOk || previewOk ? "partial" : "failed";
+    }
 
     // --- 3. Captions — always R2, regardless of storageProvider ---
-    try {
-      await R2Adapter.delete(captionsKeyOf(film.masterKey));
-      steps.captionsDelete = "ok";
-    } catch (err) {
-      // Not unexpected — captioning is itself best-effort at upload time
-      // (see uploadController.createUpload), so plenty of films never
-      // had a captions file to begin with.
-      console.warn(`Captions delete failed for film ${filmId}:`, err.message);
-      steps.captionsDelete = "failed";
+    if (captionsKey) {
+      try {
+        await R2Adapter.delete(captionsKey);
+        steps.captionsDelete = "ok";
+      } catch (err) {
+        // Not unexpected — captioning is itself best-effort at upload
+        // time (see uploadController.createUpload), so plenty of films
+        // never had a captions file to begin with.
+        console.warn(`Captions delete failed for film ${filmId}:`, err.message);
+        steps.captionsDelete = "failed";
+      }
     }
 
-    // --- 4. HLS ladder folder (Slice 15) ---
-    // Attempted whenever this film has a storage object at all,
-    // regardless of abrStatus — a failed or still-processing ABR run
-    // can still have left partial output in storage, and deletePrefix()
-    // is a safe no-op if the prefix never existed.
+    // --- 4. HLS ladder folder (Slice 15/17) ---
+    // Independent of masterKey entirely. Attempted whenever the film
+    // has a storage provider at all, regardless of abrStatus — a failed
+    // or still-processing ABR run can still have left partial output in
+    // storage, and deletePrefix() is a safe no-op if the prefix never
+    // existed.
     try {
       await adapter.deletePrefix(hlsPrefixOf(film._id));
       steps.hlsCleanup = "ok";
@@ -165,37 +185,40 @@ async function deleteFilm(filmId) {
       Sentry.captureException(err);
       steps.hlsCleanup = "failed";
     }
+  }
 
-    // --- 5. Release reserved master-file capacity — unless already
-    // released ---
-    // A "failed" transcodeStatus means one of the two existing
-    // failure-handling paths (serviceController.handleUploadCallback or
-    // uploadController.createUpload's dispatch-failure branch) already
-    // released this film's reserved capacity back to its provider —
-    // releasing it again here would double-release quota that was only
-    // ever reserved once.
-    if (film.transcodeStatus !== "failed" && typeof film.fileSizeBytes === "number") {
-      try {
-        await Provider.updateOne(
-          { name: film.storageProvider },
-          { $inc: { usedBytes: -film.fileSizeBytes } }
-        );
-        steps.capacityRelease = "ok";
-      } catch (err) {
-        console.error(`Capacity release failed for film ${filmId}:`, err.message);
-        Sentry.captureException(err);
-        steps.capacityRelease = "failed";
-      }
+  // --- 5. Release reserved master-file capacity — unless already
+  // released ---
+  // A "failed" transcodeStatus means one of the two existing
+  // failure-handling paths (serviceController.handleUploadCallback or
+  // uploadController.createUpload's dispatch-failure branch) already
+  // released this film's reserved capacity back to its provider. Gated
+  // on hasMasterKey too: if the master was already cleaned up by
+  // masterCleanupService.js, that function already released this exact
+  // capacity when it deleted the file — releasing it again here would
+  // double-release quota that was only ever reserved once.
+  if (hasMasterKey && film.transcodeStatus !== "failed" && typeof film.fileSizeBytes === "number") {
+    try {
+      await Provider.updateOne(
+        { name: film.storageProvider },
+        { $inc: { usedBytes: -film.fileSizeBytes } }
+      );
+      steps.capacityRelease = "ok";
+    } catch (err) {
+      console.error(`Capacity release failed for film ${filmId}:`, err.message);
+      Sentry.captureException(err);
+      steps.capacityRelease = "failed";
     }
   }
 
   // --- 6. Release ABR output capacity (Slice 15) ---
-  // Independent of hasStorageObject's guard above — releaseAbrCapacity
-  // internally no-ops if abrOutputBytes was never set, so it's safe to
-  // always attempt. No "already released" guard needed here the way
-  // step 5 needs one: abrOutputBytes is only ever added once, by the ABR
-  // success callback, never re-added, so there's no double-release risk
-  // to guard against.
+  // Independent of hasMasterKey above — releaseAbrCapacity internally
+  // no-ops if abrOutputBytes was never set, so it's safe to always
+  // attempt. No "already released" guard needed here the way step 5
+  // needs one: abrOutputBytes is a single running total (a
+  // regeneration adjusts it by the difference — see
+  // serviceController.handleAbrCallback), so it's only ever released
+  // once, here.
   try {
     await releaseAbrCapacity(film);
     steps.abrCapacityRelease = typeof film.abrOutputBytes === "number" ? "ok" : "skipped";

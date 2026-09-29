@@ -45,7 +45,10 @@ async function triggerWorkflow(workflowFile, inputs = {}) {
  * storageProvider tells process-upload.yml which provider's
  * credentials/endpoint to use when downloading the master and uploading
  * the resulting thumbnail/preview back — since Slice 12, a film's master
- * can live on R2, B2, or Storj, not just R2.
+ * can live on R2, B2, or Storj, not just R2. This job only ever runs at
+ * a point in a film's lifecycle where the master is guaranteed to still
+ * exist (see masterSourceResolver.js's header comment), so it always
+ * takes a plain masterKey — no Archive.org fallback needed here.
  */
 function triggerUploadProcessing(filmId, masterKey, storageProvider) {
   return triggerWorkflow("process-upload.yml", {
@@ -57,17 +60,25 @@ function triggerUploadProcessing(filmId, masterKey, storageProvider) {
 
 /**
  * Slice 15 — dispatches the separate, much longer-running ABR
- * (adaptive-bitrate) transcode workflow. Same input shape as
- * triggerUploadProcessing above (film_id/master_key/storage_provider) —
- * the worker downloads the same master file a second time and produces
- * a multi-resolution, multi-audio HLS ladder from it, entirely
- * independent of the fast thumbnail/preview job.
+ * (adaptive-bitrate) transcode workflow.
+ *
+ * Slice 17 — `source` is `{ masterKey, storageProvider, sourceUrl }`,
+ * as returned by masterSourceResolver.resolveMasterSource(): EITHER
+ * masterKey (the normal case — the worker downloads from storage the
+ * same way process-upload.yml always has) OR sourceUrl (the Archive.org
+ * fallback for a film whose master was already cleaned up — the worker
+ * downloads via a plain curl instead). storageProvider is always
+ * present either way, since the worker needs it to know where to
+ * upload the regenerated HLS output regardless of where the source
+ * came from. Every caller except uploadController.generateAbr always
+ * has a live masterKey and simply omits sourceUrl.
  */
-function triggerAbrTranscode(filmId, masterKey, storageProvider) {
+function triggerAbrTranscode(filmId, source) {
   return triggerWorkflow("abr-transcode.yml", {
     film_id: String(filmId),
-    master_key: masterKey,
-    storage_provider: storageProvider,
+    storage_provider: source.storageProvider,
+    master_key: source.masterKey || "",
+    source_url: source.sourceUrl || "",
   });
 }
 

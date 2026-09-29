@@ -2,9 +2,26 @@
 
 const Film = require("../models/Film");
 
-// Only approved films are ever shown on the public site
-async function getApprovedFilms() {
-  return Film.find({ status: "approved" }).sort({ addedDate: -1 });
+// Slice 18 — the browse grid and search results only render a poster
+// card (title/year/runtime/genres/rating) plus the client-side
+// title/director/cast/tag text filter. They never need the heavy
+// renditions/audioTracks/subtitleTracks arrays, manifest/stream URLs,
+// or admin-only status fields, so those are never even read from Mongo
+// for list views. Kept next to the queries that use it so the two can't
+// drift apart; the matching public whitelist lives in
+// services/publicFilmView.js.
+const SUMMARY_PROJECTION =
+  "title year runtime category tags posterUrl director cast ratings avgRating ratingCount views addedDate";
+
+// Slice 18 — the /admin/films list renders a card per film and never
+// shows these heavy or unused fields, so they're excluded from that one
+// list query. Any single-film action returns the full document.
+const ADMIN_LIST_EXCLUDED_FIELDS = "-renditions -audioTracks -description -license -embeddingId -fileHash";
+
+// Only approved films are ever shown on the public site. Lean summaries
+// (plain objects, summary fields only) — see SUMMARY_PROJECTION.
+async function getApprovedFilmSummaries() {
+  return Film.find({ status: "approved" }).select(SUMMARY_PROJECTION).sort({ addedDate: -1 }).lean();
 }
 
 async function getFilmById(id) {
@@ -20,9 +37,11 @@ async function getFilmsByStatus(status) {
 // "manage everything" view. Unlike getFilmsByStatus, this applies no
 // status filter at all; the frontend fetches once and filters
 // client-side by title/status tab, the same pattern /browse's FilmGrid
-// already uses at this catalog size.
+// already uses at this catalog size. Slice 18 — lean projection, see
+// ADMIN_LIST_EXCLUDED_FIELDS. Returns full (non-lean) documents minus
+// those fields so callers still get normal Mongoose serialization.
 async function getAllFilms() {
-  return Film.find({}).sort({ addedDate: -1 });
+  return Film.find({}).select(ADMIN_LIST_EXCLUDED_FIELDS).sort({ addedDate: -1 });
 }
 
 // Approved films whose last link-health check came back unhealthy — see
@@ -44,9 +63,10 @@ async function setFilmStatus(id, status, extra = {}) {
 }
 
 // Only approved films are ever returned here — search results should
-// never leak pending/rejected titles even if something stale is in Qdrant.
-async function getFilmsByIds(ids) {
-  return Film.find({ _id: { $in: ids }, status: "approved" });
+// never leak pending/rejected titles even if something stale is in
+// Qdrant. Lean summaries, same shape as the browse list.
+async function getFilmSummariesByIds(ids) {
+  return Film.find({ _id: { $in: ids }, status: "approved" }).select(SUMMARY_PROJECTION).lean();
 }
 
 // Minimal fields needed to build an embedding — used by the heavy
@@ -60,12 +80,12 @@ async function getFilmsForEmbedding() {
 }
 
 module.exports = {
-  getApprovedFilms,
+  getApprovedFilmSummaries,
   getFilmById,
   getFilmsByStatus,
   getAllFilms,
   getUnhealthyFilms,
   setFilmStatus,
-  getFilmsByIds,
+  getFilmSummariesByIds,
   getFilmsForEmbedding,
 };

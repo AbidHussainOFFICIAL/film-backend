@@ -9,6 +9,7 @@ const { mapToTaxonomy } = require("../services/categoryMapper");
 const { transcribeToVtt } = require("../services/deepgram");
 const { triggerUploadProcessing, triggerAbrTranscode } = require("../services/githubActions");
 const { releaseReservedCapacity } = require("../services/storageCapacityService");
+const { resolveMasterSource } = require("../services/masterSourceResolver");
 
 // Slice 15 — must match the same constant in controllers/
 // serviceController.js. Duplicated rather than imported from a shared
@@ -235,12 +236,24 @@ async function createUpload(req, res) {
 // previous transcodeError, rather than treating this as a continuation
 // of whatever attempt came before. Does not touch anything ABR-related —
 // see generateAbr below for that.
+//
+// Slice 17 — by construction, a film can only ever reach transcodeStatus
+// "failed" (the only state this route is meant to act on) BEFORE its
+// master could ever have been cleaned up (that only happens once
+// transcodeStatus has already reached "completed") — so this never
+// actually needs an Archive.org fallback in practice. The message below
+// is sharpened only so a direct API call against an already-cleaned-up
+// film (which shouldn't happen through the UI at all) gets a clear,
+// accurate explanation rather than a generic one.
 async function retryProcessing(req, res) {
   try {
     const film = await Film.findById(req.params.id);
     if (!film) return res.status(404).json({ error: "Film not found" });
     if (!film.masterKey) {
-      return res.status(400).json({ error: "This film has no masterKey to reprocess" });
+      const reason = film.masterDeletedAt
+        ? "This film's master file was already processed successfully and cleaned up from storage — there is nothing left to retry here."
+        : "This film has no masterKey to reprocess.";
+      return res.status(400).json({ error: reason });
     }
     if (!film.storageProvider) {
       return res
@@ -265,25 +278,28 @@ async function retryProcessing(req, res) {
 
 // POST /api/admin/uploads/:id/generate-abr
 //
-// Slice 15 — the admin-facing "Generate multi-quality" / "Retry
-// multi-quality" action, covering two real cases: a film originally
-// uploaded with the toggle off (or before Slice 15 existed at all) that
-// the admin later decides is worth the multi-quality treatment, and a
-// failed ABR job needing a manual retry (the automatic stuck-job sweep
-// deliberately never auto-retries ABR — see serviceController.
-// reconcileStuckAbrJobs for why). Works from any prior abrStatus except
-// "processing" (checked implicitly: dispatching again while one is
-// already in flight would just waste a second job on the same film —
-// the frontend already disables this button while processing, this is
-// the server-side backstop).
+// Slice 15 — the admin-facing "Generate/Retry/Regenerate multi-quality"
+// action, covering three real cases: a film originally uploaded with the
+// toggle off (or before Slice 15 existed at all) that the admin later
+// decides is worth the multi-quality treatment; a failed ABR job needing
+// a manual retry (the automatic stuck-job sweep deliberately never
+// auto-retries ABR — see serviceController.reconcileStuckAbrJobs for
+// why); and, Slice 17, an admin explicitly choosing to REGENERATE an
+// already-completed ladder (e.g. wanting to redo it after noticing an
+// issue) — which may need to run after the original master has already
+// been cleaned up from storage (see masterCleanupService.js). That last
+// case is exactly why this dispatches through resolveMasterSource
+// rather than assuming film.masterKey is always present: it transparently
+// falls back to this film's Archive.org backup as the source when the
+// master itself is gone.
 async function generateAbr(req, res) {
   try {
     const film = await Film.findById(req.params.id);
     if (!film) return res.status(404).json({ error: "Film not found" });
-    if (!film.masterKey || !film.storageProvider) {
+    if (!film.storageProvider) {
       return res
         .status(400)
-        .json({ error: "This film has no master file to generate multi-quality streaming from" });
+        .json({ error: "This film has no storage provider recorded — it may not be an own-upload." });
     }
     if (film.abrStatus === "processing") {
       return res.status(409).json({ error: "Multi-quality streaming is already being generated for this film" });
@@ -294,7 +310,15 @@ async function generateAbr(req, res) {
       });
     }
 
-    await triggerAbrTranscode(film._id, film.masterKey, film.storageProvider);
+    let source;
+    try {
+      source = await resolveMasterSource(film);
+    } catch (resolveErr) {
+      const status = resolveErr.code === "NO_SOURCE" ? 400 : 500;
+      return res.status(status).json({ error: resolveErr.message });
+    }
+
+    await triggerAbrTranscode(film._id, source);
     film.abrRequested = true;
     film.abrStatus = "processing";
     film.abrStartedAt = new Date();

@@ -26,11 +26,36 @@ const jobsRoutes = require("./routes/jobsRoutes");
 const serviceRoutes = require("./routes/serviceRoutes");
 const providerRoutes = require("./routes/providerRoutes");
 const categoryRoutes = require("./routes/categoryRoutes");
-const { connectWhatsApp } = require("./services/whatsapp");
 
 const app = express();
 
-app.use(cors());
+// Slice 18 — restricted to explicitly-listed origins instead of
+// wide-open cors(). Fails OPEN (allows all) with a loud console warning
+// if CORS_ALLOWED_ORIGINS isn't set, so an unconfigured deploy doesn't
+// silently break the frontend — but that warning is the signal to set
+// it. Requests with no Origin header at all (server-to-server calls,
+// curl, the Capacitor Android app's WebView) are always allowed; this
+// only restricts which *browser* origins may call the API directly.
+const allowedOrigins = (process.env.CORS_ALLOWED_ORIGINS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (!origin) return callback(null, true);
+      if (allowedOrigins.length === 0) {
+        console.warn(
+          "CORS_ALLOWED_ORIGINS is not set — allowing all origins. Set it in .env to restrict which sites can call this API directly from a browser."
+        );
+        return callback(null, true);
+      }
+      if (allowedOrigins.includes(origin)) return callback(null, true);
+      return callback(new Error(`Origin ${origin} is not allowed by CORS`));
+    },
+  })
+);
 app.use(express.json());
 
 // Health check
@@ -55,10 +80,15 @@ app.get("/health", (req, res) => {
 
 // Manual test route to confirm Sentry is actually wired up correctly —
 // hitting this should make an event show up in the Sentry dashboard
-// within a few seconds. Safe to leave in; it does nothing but throw.
-app.get("/api/debug-sentry", () => {
-  throw new Error("Test error — confirms Sentry reporting is working");
-});
+// within a few seconds. Slice 17 — gated to non-production: this was
+// previously a live, unauthenticated route reachable by anyone who found
+// it, confirming "this app uses Sentry" for zero benefit once you've
+// already confirmed it works once locally.
+if (process.env.NODE_ENV !== "production") {
+  app.get("/api/debug-sentry", () => {
+    throw new Error("Test error — confirms Sentry reporting is working");
+  });
+}
 
 app.use("/api/films", filmRoutes);
 app.use("/api/admin", adminRoutes);
@@ -100,19 +130,6 @@ mongoose
   .then(() => {
     console.log("Connected to MongoDB");
     console.log("Using database:", mongoose.connection.name);
-
-    // Best-effort, non-blocking — a missing/broken WhatsApp pairing
-    // shouldn't prevent the server from starting. First run without a
-    // saved session prints a QR code to this terminal to scan.
-    if (process.env.WHATSAPP_CHANNEL_JID) {
-      connectWhatsApp().catch((err) => {
-        console.error("WhatsApp connection failed to start:", err.message);
-      });
-    } else {
-      console.warn(
-        "WHATSAPP_CHANNEL_JID not set — skipping WhatsApp connection. Run scripts/whatsappSetup.js to pair and get a channel JID."
-      );
-    }
 
     // If backend/certs/localhost.pem + localhost-key.pem exist (generated
     // via mkcert — see README "Local HTTPS for testing against a deployed

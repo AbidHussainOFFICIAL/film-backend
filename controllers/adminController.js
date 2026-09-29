@@ -4,18 +4,7 @@ const Sentry = require("@sentry/node");
 const filmService = require("../services/filmService");
 const { getEmbedding, buildEmbeddingText } = require("../services/embedding");
 const { upsertFilmEmbedding, deleteFilmEmbedding } = require("../services/qdrantService");
-const { postFilmToTelegram } = require("../services/telegram");
-const { postFilmToChannel } = require("../services/whatsapp");
 const { incrementCategoryCounts, decrementCategoryCounts } = require("../services/categoryService");
-const { withTimeout } = require("../utils/withTimeout");
-
-// Hard ceiling for each best-effort post-approval side effect — see
-// utils/withTimeout.js for why this matters: a try/catch alone only
-// protects against a THROW, not a HANG (WhatsApp's postFilmToChannel in
-// particular can hang indefinitely if its persistent session isn't
-// currently live, since its initial connection-establishment step has no
-// timeout of its own).
-const SIDE_EFFECT_TIMEOUT_MS = 6 * 60 * 1000; // 6 minutes
 
 const VALID_STATUSES = ["pending", "approved", "rejected", "all"];
 
@@ -67,14 +56,10 @@ async function approveFilm(req, res) {
 
     // Respond to the admin's browser immediately, right after the
     // approval itself is safely persisted — do NOT make that request
-    // wait on Qdrant embedding, Telegram, or WhatsApp below. Any of
-    // these can be slow, and WhatsApp in particular can hang far longer
-    // than a browser request should reasonably stay open if its
-    // persistent session isn't currently live (see services/whatsapp.js).
-    // A slow/hung side effect here should never be able to leave the
-    // admin staring at a stuck "Approving…" button when the approval
-    // itself already succeeded. Same fix, same reasoning, as
-    // serviceController.js's handleUploadCallback.
+    // wait on the Qdrant embedding step below, which can occasionally be
+    // slow. A slow/hung side effect here should never be able to leave
+    // the admin staring at a stuck "Approving…" button when the
+    // approval itself already succeeded.
     res.json(film);
 
     runPostApprovalSideEffects(film).catch((err) => {
@@ -94,8 +79,13 @@ async function approveFilm(req, res) {
 
 // Runs AFTER approveFilm has already responded — see the comment above
 // where this is invoked. Every step here keeps its own try/catch, so a
-// failure in one (or all three) never affects the approval that already
-// succeeded in Mongo.
+// failure in one never affects the approval that already succeeded in
+// Mongo. This path is for archive.org-sourced (and any manually-approved
+// pending) films only — own-uploads auto-approve through a separate path
+// (see serviceController.js's own runPostApprovalSideEffects), which is
+// also the only place Archive.org backup / master-cleanup logic applies,
+// since only own-uploads ever have a storageProvider/masterKey to begin
+// with.
 async function runPostApprovalSideEffects(film) {
   // Fast, synchronous, no external network call — runs first and
   // unconditionally, no timeout needed.
@@ -115,38 +105,6 @@ async function runPostApprovalSideEffects(film) {
   } catch (embedErr) {
     console.error(`Embedding/indexing failed for film ${film._id}:`, embedErr.message);
     Sentry.captureException(embedErr);
-  }
-
-  // Post to the WhatsApp channel first — ordered ahead of Telegram to
-  // match the priority used in serviceController.js's equivalent chain
-  // (Archive.org, then WhatsApp, then Telegram there — there's no
-  // Archive.org step here, since that only applies to own-uploads).
-  // Best-effort — a failure here (not paired, channel JID wrong)
-  // shouldn't undo the approval.
-  try {
-    await withTimeout(postFilmToChannel(film), SIDE_EFFECT_TIMEOUT_MS, "WhatsApp post");
-    film.whatsappPost = { pushed: true, status: "completed", pushedDate: new Date() };
-    await film.save().catch(() => {});
-  } catch (whatsappErr) {
-    console.error(`WhatsApp post failed for film ${film._id}:`, whatsappErr.message);
-    Sentry.captureException(whatsappErr);
-    film.whatsappPost = { pushed: false, status: "failed", error: whatsappErr.message };
-    await film.save().catch(() => {});
-  }
-
-  // Post to the Telegram channel. Best-effort like WhatsApp — a failure
-  // here (bad bot token, self-hosted server down, channel permissions)
-  // shouldn't undo the approval, it just means this title didn't get
-  // announced.
-  try {
-    await withTimeout(postFilmToTelegram(film), SIDE_EFFECT_TIMEOUT_MS, "Telegram post");
-    film.telegramPost = { pushed: true, status: "completed", pushedDate: new Date() };
-    await film.save().catch(() => {});
-  } catch (telegramErr) {
-    console.error(`Telegram post failed for film ${film._id}:`, telegramErr.message);
-    Sentry.captureException(telegramErr);
-    film.telegramPost = { pushed: false, status: "failed", error: telegramErr.message };
-    await film.save().catch(() => {});
   }
 }
 
@@ -186,9 +144,8 @@ async function rejectFilm(req, res) {
 // approveFilm's side effects above) — deleteFilmEmbedding() already
 // swallows its own errors internally (see qdrantService.js) and
 // decrementCategoryCounts() does too (see categoryService.js); neither
-// is a multi-integration chain with a known hang risk like Telegram/
-// WhatsApp, so there's nothing here that needs decoupling from the
-// response.
+// is a slow external chain with a known hang risk, so there's nothing
+// here that needs decoupling from the response.
 async function rejectOrRemoveFilm(filmId, verifiedBy) {
   const existing = await filmService.getFilmById(filmId);
   if (!existing) return null;

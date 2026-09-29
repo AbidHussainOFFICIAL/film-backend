@@ -8,6 +8,7 @@ const filmManagementController = require("../controllers/filmManagementControlle
 const uploadController = require("../controllers/uploadController");
 const providerController = require("../controllers/providerController");
 const logController = require("../controllers/logController");
+const metadataController = require("../controllers/metadataController");
 
 // Every route below requires a valid Firebase ID token
 router.use(verifyFirebaseToken);
@@ -41,6 +42,11 @@ router.post("/films/:id/remove", filmManagementController.removeFilm);
 router.post("/films/:id/restore", filmManagementController.restoreFilm);
 router.delete("/films/:id", filmManagementController.deleteFilm);
 
+// POST /api/admin/films/:id/retry-backup (Slice 17) — re-attempts a
+// failed Archive.org backup so a single transient IA hiccup doesn't
+// permanently block that film's master-file cleanup.
+router.post("/films/:id/retry-backup", filmManagementController.retryArchiveBackup);
+
 // GET /api/admin/upload-url?filename=...&contentType=...&fileSizeBytes=...&fingerprint=...
 router.get("/upload-url", uploadController.getUploadUrl);
 
@@ -64,5 +70,14 @@ router.post("/qdrant/init", providerController.initQdrantCollection);
 // models/IngestionLog.js) — this data was already being written, just
 // never surfaced anywhere until now.
 router.get("/logs", logController.listIngestionLogs);
+
+// --- Slice 18: movie metadata (TMDb search/apply, OMDb ratings) ---
+// GET /api/admin/films/:id/metadata/search?query=...&year=...
+router.get("/films/:id/metadata/search", metadataController.searchMetadata);
+// POST /api/admin/films/:id/metadata/apply  Body: { tmdbId }
+router.post("/films/:id/metadata/apply", metadataController.applyMetadata);
+// POST /api/admin/films/:id/metadata/ratings — separate action, OMDb's
+// free tier caps at 1,000 req/day (see services/omdb.js).
+router.post("/films/:id/metadata/ratings", metadataController.fetchRatings);
 
 module.exports = router;
